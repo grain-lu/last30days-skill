@@ -335,6 +335,18 @@ def _subprocess_env(home: str) -> Dict[str, str]:
     keep = ("PATH", "LANG", "LC_ALL", "TMPDIR", "SystemRoot")
     env = {k: os.environ[k] for k in keep if k in os.environ}
     env.setdefault("PATH", os.defpath)
+    # 本地补丁:代理变量透传 + node fetch 认代理。上游剥离一切非常量环境
+    # 变量是防泄漏,但代理出口网络的主机上 grok CLI(node 系)拿不到代理
+    # 会直连超时,后端整个不可用。注意:若代理 URL 内嵌凭据,会随 env 暴露
+    # 给子进程(bypassPermissions 下可被读取),本机代理为本地无凭据形式。
+    for proxy_var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                      "NO_PROXY", "no_proxy"):
+        val = os.environ.get(proxy_var)
+        if val:
+            env[proxy_var] = val
+    if any(env.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")) \
+            and "--use-env-proxy" not in (env.get("NODE_OPTIONS") or ""):
+        env["NODE_OPTIONS"] = ((env.get("NODE_OPTIONS") or "").strip() + " --use-env-proxy").strip()
     env["HOME"] = home
     if os.name == "nt":
         env["USERPROFILE"] = home
