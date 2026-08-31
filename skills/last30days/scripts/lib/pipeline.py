@@ -38,6 +38,7 @@ from . import (
     github,
     grok_x,
     grounding,
+    grok_x,
     hackernews,
     health,
     hiring_signals,
@@ -5773,11 +5774,18 @@ def _retrieve_stream_impl(
                 chain_errors.append((msg, last_state))
                 print("[X] chain budget exhausted; skipping remaining backends", file=sys.stderr)
                 break
-            with http.tee_failures() as backend_failures:
-                items, err, err_state = _attempt_x_backend_memo(
-                    backend, x_query, from_date, to_date, depth, config, warnings=x_warnings,
-                    deadline=chain_deadline,
-                )
+            try:
+                with http.tee_failures() as backend_failures:
+                    items, err, err_state = _attempt_x_backend_memo(
+                        backend, x_query, from_date, to_date, depth, config, warnings=x_warnings,
+                        deadline=chain_deadline,
+                    )
+            except Exception as exc:
+                # 异常兜底(本地补丁):上游 _attempt_x_backend 只捕 http.HTTPError,
+                # 其他异常(解码/键错/编程错误)仍会炸掉整个 x source、跳过剩余
+                # 后端 —— 转成 chain 错误走 failover。
+                items, err, err_state = [], f"{type(exc).__name__}: {exc}", health.UNREACHABLE
+                backend_failures = []
             if items:
                 if i > 0:
                     # xapi is metered: name the spend when it served as a backup.

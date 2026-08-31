@@ -6,7 +6,9 @@ import ipaddress
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -283,6 +285,86 @@ class GeminiClient(ReasoningClient):
         )
         return extract_gemini_text(payload)
 
+
+def _gemini_cli_active(config: dict[str, Any]) -> bool:
+    """gemini CLI 推理后端 opt-in 开关:LAST30DAYS_GEMINI_CLI=1 显式启用。
+
+    Google 已于 2026 停用个人版 Gemini CLI 的 OAuth client(登录被服务端
+    拒绝,指引迁移 Antigravity),默认关闭以免每次调用白跑一次必败的 CLI
+    再降级。未来出现可用的 headless 认证方式时改回默认开启即可。
+    启用条件:显式 opt-in + gemini 已安装 + OAuth token 未过期(过期凭据
+    会让 CLI 挂到超时才降级)。
+    """
+    opt_in = (config.get("LAST30DAYS_GEMINI_CLI") or "").strip().lower()
+    if opt_in not in ("1", "true", "yes", "on"):
+        return False
+    from shutil import which
+    if not which("gemini"):
+        return False
+    creds_path = os.path.expanduser("~/.gemini/oauth_creds.json")
+    try:
+        with open(creds_path, encoding="utf-8") as fh:
+            expiry_ms = json.load(fh).get("expiry_date") or 0
+    except (OSError, json.JSONDecodeError):
+        return False
+    return expiry_ms / 1000 > time.time()
+
+
+class GeminiCliClient(ReasoningClient):
+    """gemini CLI(OAuth 订阅账号)推理后端。
+
+    走 Google One AI Pro 订阅配额(约 1500 请求/天)而非 API key 的免费池
+    (250/天,超出按量计费)。CLI 失败(配额尽/网络/解析)时降级到内嵌的
+    API-key client,run 不因 CLI 挂掉。
+    """
+
+    name = "gemini"
+
+    def __init__(self, fallback: GeminiClient | None = None):
+        self.fallback = fallback
+
+    def generate_text(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        response_mime_type: str | None = None,
+    ) -> str:
+        # planner/rerank 不使用 tools;JSON 输出靠 prompt 约束 + extract_json
+        # 兜底,故 tools/response_mime_type 不透传给 CLI。
+        cmd = ["gemini", "-m", model, "-p", prompt, "--output-format", "json"]
+        run_env = dict(os.environ)
+        # node 原生 fetch 无视 *_PROXY(与 bird_x 同坑):无此开关时 CLI 在
+        # 代理出口网络下会挂死。
+        if any(run_env.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")) \
+                and "--use-env-proxy" not in (run_env.get("NODE_OPTIONS") or ""):
+            run_env["NODE_OPTIONS"] = ((run_env.get("NODE_OPTIONS") or "").strip() + " --use-env-proxy").strip()
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=150, env=run_env,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"gemini CLI exit {proc.returncode}: {(proc.stderr or '')[:200]}"
+                )
+            envelope = json.loads(proc.stdout)
+            text_out = str(envelope.get("response") or envelope.get("text") or "")
+            if not text_out:
+                raise RuntimeError("gemini CLI returned empty text")
+            return text_out
+        except Exception as exc:
+            if self.fallback is not None:
+                print(
+                    f"[GeminiCli] CLI path failed ({type(exc).__name__}: {str(exc)[:120]}); "
+                    "falling back to API-key client",
+                    file=sys.stderr,
+                )
+                return self.fallback.generate_text(
+                    model, prompt, tools=tools, response_mime_type=response_mime_type,
+                )
+            raise
+
 class OpenAIClient(ReasoningClient):
     name = "openai"
 
@@ -480,16 +562,21 @@ def resolve_runtime(config: dict[str, Any], depth: str) -> tuple[schema.Provider
     planner_model, rerank_model = _resolve_model_pins(config, depth, provider_name)
 
     if provider_name == "gemini":
-        if not google_key:
-            raise RuntimeError("Gemini selected but no Google API key is configured.")
         runtime = schema.ProviderRuntime(
             reasoning_provider="gemini",
             planner_model=planner_model,
             rerank_model=rerank_model,
-    
+
             x_search_backend=_resolve_x_backend(config),
         )
-        return runtime, GeminiClient(google_key)
+        api_client = GeminiClient(google_key) if google_key else None
+        # CLI(OAuth 订阅配额)优先;CLI 可用时不需要 API key,fallback 仅在
+        # 有 key 时提供。
+        if _gemini_cli_active(config):
+            return runtime, GeminiCliClient(fallback=api_client)
+        if not google_key:
+            raise RuntimeError("Gemini selected but no Google API key is configured.")
+        return runtime, api_client
 
     if provider_name == "openai":
         if not openai_token or config.get("OPENAI_AUTH_STATUS") != env.AUTH_STATUS_OK:

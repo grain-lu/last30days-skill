@@ -117,6 +117,11 @@ def _subprocess_env() -> Dict[str, str]:
     # Hard-disable browser-cookie fallback so normal pipeline runs never hit
     # Safari/Chrome Keychain prompts during source detection or search.
     env["BIRD_DISABLE_BROWSER_COOKIES"] = "1"
+    # node 原生 fetch 默认无视 *_PROXY 环境变量:需要代理才能到 x.com 的主机上,
+    # bird 子进程会直连 30s 超时。--use-env-proxy(node 22+)让 fetch 认代理。
+    has_proxy = any(env.get(k) for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"))
+    if has_proxy and "--use-env-proxy" not in (env.get("NODE_OPTIONS") or ""):
+        env["NODE_OPTIONS"] = ((env.get("NODE_OPTIONS") or "").strip() + " --use-env-proxy").strip()
     return env
 
 

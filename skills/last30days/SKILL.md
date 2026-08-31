@@ -16,6 +16,7 @@ metadata:
       env: []
       optionalEnv:
         - SCRAPECREATORS_API_KEY
+        - TRANSCRIPT_API_KEY
         - OPENAI_API_KEY
         - XAI_API_KEY
         - X_BEARER_TOKEN

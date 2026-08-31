@@ -658,6 +658,10 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('XAI_BASE_URL', None),
         ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
+        # TranscriptAPI (transcriptapi.com) YouTube transcript fallback key
+        # from the ZeroPointRepo youtube-skills `yt` skill. Mirrors the
+        # ScrapeCreators tier; read by lib/youtube_yt._ta_key().
+        ('TRANSCRIPT_API_KEY', None),
         ('APIFY_API_TOKEN', None),
         ('AUTH_TOKEN', None),
         ('CT0', None),
@@ -786,6 +790,13 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
                 config[key] = default
         else:
             config[key] = os.environ.get(key) or merged_env.get(key, default)
+    # GEMINI_API_KEY 格式防御:shell 环境常驻的多上游中转变量(~/.llm_env)
+    # 会 export 一个 OpenAI 兼容的 sk- token 给 Claude Code 切上游用,但它
+    # 对 Google 原生 API 必然无效(合法 Google key 一律 AIza 开头),且环境
+    # 变量优先级最高、会压住 Keychain 里的真 key —— 跳过 os.environ 层,
+    # 回退到 Keychain/.env 层的值。
+    if str(config.get('GEMINI_API_KEY') or '').startswith('sk-'):
+        config['GEMINI_API_KEY'] = merged_env.get('GEMINI_API_KEY')
 
     # Export debug flag to os.environ so log.py's lazy os.environ.get()
     # picks up .env values. setdefault ensures a shell-exported value is

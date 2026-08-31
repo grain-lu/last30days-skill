@@ -1024,7 +1024,9 @@ def fetch_transcript(
     Uses yt-dlp when available (preferred, more robust). Falls back to
     direct HTTP transcript fetching when yt-dlp is not installed, and finally
     to the ScrapeCreators transcript endpoint when a key is present and the
-    keyless cascade comes back empty.
+    keyless cascade comes back empty. When ``TRANSCRIPT_API_KEY`` is set, the
+    TranscriptAPI endpoint covers the same fallback tier without a key (see
+    ``_ta_fetch_transcript``).
 
     Args:
         video_id: YouTube video ID
@@ -1044,6 +1046,7 @@ def fetch_transcript(
     """
     raw_vtt = None
     ssh_host = _ytdlp_ssh_host()
+    ta_key = _ta_key()
     if ssh_host and is_ytdlp_installed():
         raw_vtt = _fetch_transcript_ytdlp_via_ssh(video_id, ssh_host)
         if not raw_vtt:
@@ -1051,7 +1054,8 @@ def fetch_transcript(
             raw_vtt = _fetch_transcript_direct(video_id, status=status)
     elif is_ytdlp_installed():
         raw_vtt = _fetch_transcript_ytdlp(
-            video_id, temp_dir, status=status, fast_fail=bool(token),
+            video_id, temp_dir, status=status,
+            fast_fail=bool(token or _ta_key()),
         )
         if not raw_vtt:
             ytdlp_error = (status or {}).get("ytdlp_error")
@@ -1094,6 +1098,15 @@ def fetch_transcript(
             if status is not None:
                 status["sc_rescued"] = True
             return sc_transcript
+
+    # TranscriptAPI fallback: same tier as SC, but keyed off TRANSCRIPT_API_KEY
+    # (free 100-credit account at transcriptapi.com). Same no_caption_tracks
+    # guard — an uploader with captions disabled returns 404 here too, so don't
+    # spend a credit on a video proven caption-less.
+    if ta_key and _should_try_sc_transcript(status):
+        ta_transcript = _ta_fetch_transcript(video_id)
+        if ta_transcript:
+            return ta_transcript
 
     _log(f"No transcript available for {video_id}")
     return None
@@ -1814,3 +1827,79 @@ def _sc_fetch_transcript(video_id: str, token: str) -> Optional[str]:
         transcript = " ".join(words[:TRANSCRIPT_MAX_WORDS]) + "..."
 
     return transcript if transcript else None
+
+
+# ---------------------------------------------------------------------------
+# TranscriptAPI (transcriptapi.com) fallback
+# ---------------------------------------------------------------------------
+# Mirrors the ScrapeCreators tier: yt-dlp stays primary, this covers hard
+# transcript failures (bot-gate / stale binary / SSH-host down) with a
+# server-side fetch. Same API as the ZeroPointRepo youtube-skills `yt` skill.
+# Active only when TRANSCRIPT_API_KEY is set; the transcript endpoint charges
+# 1 credit on success only (404/errors are free).
+
+TRANSCRIPTAPI_BASE = "https://transcriptapi.com/api/v2/youtube"
+
+_TA_KEY_RESOLVED = False
+_TA_KEY_CACHE = ""
+
+
+def _ta_key() -> str:
+    """TranscriptAPI key from TRANSCRIPT_API_KEY (process env or config file).
+
+    Read once per process: `get_config` merges keychain/pass/.env and is
+    expensive, so avoid re-resolving it for every parallel video fetch.
+    """
+    global _TA_KEY_CACHE, _TA_KEY_RESOLVED
+    if not _TA_KEY_RESOLVED:
+        key = os.environ.get("TRANSCRIPT_API_KEY", "").strip()
+        if not key:
+            # Deferred import: env.py imports this module lazily, so importing
+            # it at module load here would be circular.
+            from .env import get_config
+            key = str(get_config().get("TRANSCRIPT_API_KEY") or "").strip()
+        _TA_KEY_CACHE = key
+        _TA_KEY_RESOLVED = True
+    return _TA_KEY_CACHE
+
+
+def _ta_fetch_transcript(video_id: str) -> Optional[str]:
+    """Fetch a video transcript via TranscriptAPI (server-side, no bot-wall).
+
+    Mirrors ``_sc_fetch_transcript``: returns cleaned, word-capped plaintext
+    (or None). ``format=text&include_timestamp=false`` keeps the response a
+    clean string instead of timestamped segments, so no VTT cleaning is needed
+    beyond whitespace collapse.
+    """
+    try:
+        data = http.get(
+            f"{TRANSCRIPTAPI_BASE}/transcript",
+            params={
+                "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                "format": "text",
+                "include_timestamp": "false",
+                "send_metadata": "false",
+            },
+            headers={
+                "Authorization": f"Bearer {_ta_key()}",
+                # Cloudflare 403s (error 1010) without a real User-Agent.
+                "User-Agent": "last30days-skill/3.9.4",
+            },
+            timeout=30,
+            retries=1,
+        )
+    except Exception as exc:
+        _log(f"TranscriptAPI transcript error for {video_id}: {exc}")
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    text = data.get("transcript") or ""
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    text = _clean_vtt(text)
+    words = text.split()
+    if len(words) > TRANSCRIPT_MAX_WORDS:
+        text = " ".join(words[:TRANSCRIPT_MAX_WORDS]) + "..."
+    return text if text.strip() else None
