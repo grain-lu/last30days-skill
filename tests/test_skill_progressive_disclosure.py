@@ -52,7 +52,9 @@ def test_configured_user_without_global_marker_has_a_bounded_setup_check():
     total = len((SKILL_ROOT / "SKILL.md").read_bytes()) + sum(
         len(reference_text(name).encode("utf-8")) for name in names
     )
-    assert total <= 190_000, f"configured path without a global marker loads {total} bytes"
+    # 本地 fork 抬高 1KB:TRANSCRIPT_API_KEY 注册 + weixin/bilibili 中文源
+    # 文档行(上游 v3.28.0 正好压线 190_000,任何本地增量都会超)。
+    assert total <= 191_000, f"configured path without a global marker loads {total} bytes"
 
 
 def test_existing_users_can_load_repair_without_restarting_onboarding():

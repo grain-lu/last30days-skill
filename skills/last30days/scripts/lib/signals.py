@@ -139,6 +139,7 @@ _VOTE_LOG_REFERENCE: dict[str, float] = {
     "hackernews": 6.2,   # ~log1p(500)
     "devto":      3.0,   # ~log1p(20) direct replies; the API has no comment likes
     "youtube":    10.3,  # ~log1p(30000)
+    "bilibili":   10.3,  # ~log1p(30000); video platform, same scale as youtube
     "tiktok":     10.3,  # ~log1p(30000)
     "instagram":  9.2,   # ~log1p(10000)
     "x":          9.2,   # ~log1p(10000)
@@ -270,7 +271,8 @@ def _generic_engagement(item: schema.SourceItem) -> float | None:
 def engagement_raw(item: schema.SourceItem) -> float | None:
     if item.source == "reddit":
         return _reddit_engagement(item)
-    if item.source == "youtube":
+    if item.source in ("youtube", "bilibili"):
+        # bilibili 同为视频平台,engagement 字段同型(views/likes/comments)
         return _youtube_engagement(item)
     if item.source == "tiktok":
         return _tiktok_engagement(item)
@@ -327,6 +329,8 @@ _ENGAGEMENT_LOG_REFERENCE: dict[str, float] = {
 _NO_ENGAGEMENT_SCORE_SOURCES = frozenset({
     "jobs", "meta_ads", "grounding", "perplexity", "stocktwits", "telegram",
     "arxiv", "techmeme", "dripstack", "corpus",
+    # weixin - Sogou results expose no public engagement counts
+    "weixin",
 })
 
 
@@ -339,7 +343,7 @@ _NO_ENGAGEMENT_SCORE_SOURCES = frozenset({
 # views, ~100k likes, ~3k comments: 0.45*14.9 + 0.32*11.5 + 0.13*8.0 = 11.4).
 # Resulting scores: 117 views/1 like ~3, 655 views/17 likes ~17, 133k views/
 # 8.4k likes ~70, 726k views/13k likes ~85, 1M+ views ~90-100.
-_VIEW_ENGAGEMENT_SOURCES = frozenset({"youtube", "tiktok", "instagram"})
+_VIEW_ENGAGEMENT_SOURCES = frozenset({"youtube", "bilibili", "tiktok", "instagram"})
 _VIEW_ENGAGEMENT_LOG_FLOOR = 2.1
 _VIEW_ENGAGEMENT_LOG_REFERENCE = 11.5
 
