@@ -374,7 +374,22 @@ def test_owned_loopback_transport_remains_real(tmp_path):
     assert "1 passed" in result.stdout
 
 
+def _bindable(address):
+    probe = socket.socket()
+    try:
+        probe.bind((address, 0))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
 def test_owned_port_does_not_authorize_another_loopback_address(tmp_path):
+    # Linux binds any 127/8 address by default; macOS lo0 only has 127.0.0.1
+    # until an alias is added (`sudo ifconfig lo0 alias 127.0.0.2 up`).
+    if not _bindable("127.0.0.2"):
+        pytest.skip("127.0.0.2 is not configured on this host's loopback interface")
     canary = f"address-{uuid.uuid4().hex}"
     result = _run_probe(tmp_path, f"""
         import socket

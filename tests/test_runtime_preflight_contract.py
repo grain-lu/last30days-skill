@@ -159,7 +159,9 @@ class RuntimePreflightExecutionTests(unittest.TestCase):
             None,
         )
         self.assertIsNotNone(assignment, "preflight must print a reusable shell assignment")
-        self.assertEqual(assignment, f"LAST30DAYS_PYTHON={shlex.quote(str(candidate))}")
+        # The preflight resolves a relative candidate against its cwd, which on
+        # macOS can cross the /var -> /private/var symlink; compare resolved.
+        self.assertEqual(assignment, f"LAST30DAYS_PYTHON={shlex.quote(str(candidate.resolve()))}")
 
         installed = self.root / "welcome skill"
         (installed / "scripts").mkdir(parents=True)
