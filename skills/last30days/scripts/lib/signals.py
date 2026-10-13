@@ -11,6 +11,8 @@ from . import dates, relevance, schema
 # social platforms discounted for noise.
 SOURCE_QUALITY = {
     "xiaohongshu": 0.7,
+    "weixin": 0.7,
+    "bilibili": 0.65,
     "hackernews": 0.8,
     "devto": 0.78,
     "youtube": 0.85,

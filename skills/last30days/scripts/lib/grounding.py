@@ -357,6 +357,10 @@ def web_search(
         # discard the successfully retrieved results and report the source failed.
         with http.capture_failures():
             items = _enrich_reddit_items(items)
+    if items:
+        from . import crawl4ai_enrich
+        with http.capture_failures():
+            items = crawl4ai_enrich.enrich_items(items, config)
     return items, artifact
 
 

@@ -267,6 +267,41 @@ def activate_telegram_for_explicit_sources(
     return requested_sources
 
 
+def activate_weixin_for_explicit_sources(
+    config: dict,
+    requested_sources: list[str] | None,
+    *,
+    accounts: str,
+) -> list[str] | None:
+    """Activate opt-in weixin when the user pinned --weixin-sources."""
+    excluded = {
+        token.strip().lower()
+        for token in str(config.get("EXCLUDE_SOURCES") or "").split(",")
+        if token.strip()
+    }
+    if "weixin" in excluded:
+        sys.stderr.write(
+            f"[Weixin] --weixin-sources={accounts} ignored: weixin is in EXCLUDE_SOURCES\n"
+        )
+        return requested_sources
+
+    config["WEIXIN_SOURCES"] = accounts
+
+    include = str(config.get("INCLUDE_SOURCES") or "")
+    tokens = [token.strip() for token in include.split(",") if token.strip()]
+    if "weixin" not in {token.lower() for token in tokens}:
+        tokens.append("weixin")
+        config["INCLUDE_SOURCES"] = ",".join(tokens)
+        sys.stderr.write(
+            f"[Weixin] --weixin-sources={accounts} activated weixin source "
+            "(add to INCLUDE_SOURCES permanently to skip this auto-enable)\n"
+        )
+
+    if requested_sources is not None and "weixin" not in requested_sources:
+        requested_sources = [*requested_sources, "weixin"]
+    return requested_sources
+
+
 def slugify(value: str, max_length: int = 180) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     if len(slug) > max_length:
@@ -900,6 +935,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Accepts: bare handle (aipost), @handle (@aipost), "
             "t.me URL (https://t.me/aipost), or preview URL (https://t.me/s/aipost). "
             "Rejects joinchat links and numeric -100 supergroup IDs."
+        ),
+    )
+    parser.add_argument(
+        "--weixin-sources",
+        help=(
+            "Comma-separated Weixin (公众号) account names. "
+            "Auto-activates the opt-in weixin source for this run. "
+            "Without this flag, INCLUDE_SOURCES=weixin still searches the topic "
+            "via public Sogou Weixin search."
         ),
     )
     parser.add_argument(
@@ -3733,6 +3777,15 @@ def _main(
             config,
             requested_sources,
             channels=cli_telegram_sources,
+        )
+    cli_weixin_sources = (
+        args.weixin_sources.strip() if args.weixin_sources else ""
+    )
+    if cli_weixin_sources:
+        requested_sources = activate_weixin_for_explicit_sources(
+            config,
+            requested_sources,
+            accounts=cli_weixin_sources,
         )
     # --devto-tags activates the off-by-default dev.to source for this run
     # (the --trustpilot-domain pattern): carried on config for the dispatch,

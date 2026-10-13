@@ -155,6 +155,8 @@ SOURCE_CAPABILITIES = {
     "meta_ads": {"reference", "company_signal", "product_signal"},
     "xiaohongshu": {"video", "video_shortform", "social"},
     "telegram": {"discussion", "social"},
+    "weixin": {"discussion", "social", "link"},
+    "bilibili": {"video", "video_shortform", "social"},
     "github": {"discussion", "link"},
     "grounding": {"web", "reference", "link"},
     "perplexity": {"web", "reference", "analysis"},

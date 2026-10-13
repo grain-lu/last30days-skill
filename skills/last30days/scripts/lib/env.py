@@ -733,6 +733,8 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
         ('EXCLUDE_SOURCES', ''),
+        ('WEIXIN_SOURCES', ''),
+        ('LAST30DAYS_CRAWL4AI', None),
         ('LAST30DAYS_DEFAULT_SEARCH', ''),
         # Resolve the user-facing default in last30days.py so an absent value
         # stays distinguishable from an explicit `default`. That distinction

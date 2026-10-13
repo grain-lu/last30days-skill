@@ -67,6 +67,8 @@ def normalize_source_items(
         "telegram": lambda s, i, idx, fd, td: _normalize_microblog(
             s, i, idx, fd, td, "TG", "Telegram post"
         ),
+        "weixin": _normalize_grounding,
+        "bilibili": _normalize_grounding,
         "xquik": _normalize_x,
         "pinterest": _normalize_pinterest,
         "polymarket": _normalize_polymarket,
@@ -1063,7 +1065,7 @@ def _normalize_grounding(
         title=title or _domain_from_url(url) or f"Web result {index + 1}",
         body="\n".join(part for part in [title, snippet] if part),
         url=url,
-        author=None,
+        author=item.get("author"),
         container=str(item.get("source_domain") or _domain_from_url(url) or ""),
         published_at=item.get("date"),
         date_confidence=_date_confidence(item, from_date, to_date),

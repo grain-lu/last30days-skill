@@ -172,6 +172,8 @@ SOURCE_ORDER = (
     "instagram",
     "threads",
     "telegram",
+    "weixin",
+    "bilibili",
     "bluesky",
     "truthsocial",
     "perplexity",
@@ -822,6 +824,41 @@ def _telegram_record(config):
     )
 
 
+def _weixin_record(config):
+    requires = "INCLUDE_SOURCES=weixin (optional WEIXIN_SOURCES)"
+    include = env.include_sources(config)
+    accounts = [
+        part.strip()
+        for part in str(config.get("WEIXIN_SOURCES") or "").split(",")
+        if part.strip()
+    ]
+    if "weixin" in include:
+        detail = (
+            f"{len(accounts)} account(s) configured"
+            if accounts
+            else "topic search (no WEIXIN_SOURCES)"
+        )
+        return _record(status=health.OK, requires=requires, detail=detail)
+    return _record(
+        status="opt-in",
+        requires=requires,
+        fix="add weixin to INCLUDE_SOURCES (or --search weixin / --weixin-sources)",
+        note="public Sogou Weixin search; no login cookies",
+    )
+
+
+def _bilibili_record(config):
+    requires = "INCLUDE_SOURCES=bilibili"
+    if "bilibili" in env.include_sources(config):
+        return _record(status=health.OK, requires=requires)
+    return _record(
+        status="opt-in",
+        requires=requires,
+        fix="add bilibili to INCLUDE_SOURCES (or --search bili)",
+        note="public Bilibili search API; no login",
+    )
+
+
 def _bluesky_record(config):
     if env.is_bluesky_available(config):
         return _record(status=health.OK, requires="BSKY_HANDLE + BSKY_APP_PASSWORD")
@@ -1008,6 +1045,8 @@ _SOURCE_BUILDERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "instagram": _instagram_record,
     "threads": _threads_record,
     "telegram": _telegram_record,
+    "weixin": _weixin_record,
+    "bilibili": _bilibili_record,
     "bluesky": _bluesky_record,
     "truthsocial": _truthsocial_record,
     "perplexity": _perplexity_record,

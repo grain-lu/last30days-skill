@@ -23,6 +23,7 @@ from typing import Any
 from . import (
     amazon,
     arxiv,
+    bilibili,
     bird_x,
     bluesky,
     brightdata,
@@ -80,6 +81,7 @@ from . import (
     xai_x,
     xiaohongshu_api,
     xquik,
+    weixin,
     xurl_x,
     youtube_yt,
 )
@@ -108,6 +110,9 @@ SEARCH_ALIAS = {
     "xhs": "xiaohongshu",
     "meta": "meta_ads",
     "meta-ads": "meta_ads",
+    "wx": "weixin",
+    "wechat": "weixin",
+    "bili": "bilibili",
     "xquik": "x",  # xquik is a backend of the single "x" source, not its own source
 }
 
@@ -122,6 +127,8 @@ SEARCH_ALIAS = {
 MAX_SOURCE_FETCHES: dict[str, int] = {
     "x": 2, "jobs": 1, "linkedin": 1, "stocktwits": 1, "trustpilot": 1, "amazon": 1,
     "telegram": 1, "meta_ads": 1, "devto": 1,
+    "weixin": 1,
+    "bilibili": 1,
 }
 
 # Sources whose thin result is their normal success state, so the "<3 items"
@@ -329,6 +336,8 @@ MOCK_AVAILABLE_SOURCES = [
     "dripstack",
     "telegram",
     "devto",
+    "weixin",
+    "bilibili",
 ]
 
 
@@ -520,6 +529,11 @@ def available_sources(
     ):
         if telegram.is_telegram_configured(config):
             available.append("telegram")
+    # Weixin / Bilibili: opt-in additive CN sources. Public search, no key.
+    if "weixin" in include_sources or (requested_sources and "weixin" in requested_sources):
+        available.append("weixin")
+    if "bilibili" in include_sources or (requested_sources and "bilibili" in requested_sources):
+        available.append("bilibili")
     # xquik is a backend of the single "x" source (see env.x_backend_chain),
     # not a separate parallel source — registered via the "x" entry above.
     exclude = {s.strip().lower() for s in (config.get("EXCLUDE_SOURCES") or "").split(",") if s.strip()}
@@ -6246,6 +6260,20 @@ def _retrieve_stream_impl(
             config=config,
         )
         return telegram.parse_telegram_response(result), _result_outcome_artifact(source, result)
+    if source == "weixin":
+        result = weixin.search_weixin(
+            subquery.search_query, from_date, to_date,
+            depth=depth,
+            config=config,
+        )
+        return weixin.parse_weixin_response(result), _result_outcome_artifact(source, result)
+    if source == "bilibili":
+        result = bilibili.search_bilibili(
+            subquery.search_query, from_date, to_date,
+            depth=depth,
+            config=config,
+        )
+        return bilibili.parse_bilibili_response(result), _result_outcome_artifact(source, result)
     if source == "truthsocial":
         result = truthsocial.search_truthsocial(subquery.search_query, from_date, to_date, depth=depth, config=config)
         return truthsocial.parse_truthsocial_response(result), _result_outcome_artifact(source, result)

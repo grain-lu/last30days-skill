@@ -226,6 +226,8 @@ SOURCE_LABELS = {
     "truthsocial": "Truth Social",
     "linkedin": "LinkedIn",
     "xiaohongshu": "Xiaohongshu",
+    "weixin": "Weixin",
+    "bilibili": "Bilibili",
     "x": "X",
     "github": "GitHub",
     "digg": "Digg",
@@ -2889,6 +2891,8 @@ _FOOTER_SOURCES: list[tuple[str, str, str, str, list[tuple[str, str]]]] = [
     # Jobs must appear so a scoped --hiring-signals run (jobs-only) still emits
     # the LAW 5 footer; without it the footer was dropped entirely.
     ("jobs", "💼", "Jobs", "role", []),
+    ("weixin", "🟢", "Weixin", "article", []),
+    ("bilibili", "📺", "Bilibili", "video", [("views", "views"), ("likes", "likes")]),
     ("perplexity", "🧠", "Perplexity", "result", [("citations", "citations")]),
     ("corpus", "🔒", "Your files", "file", []),
 ]

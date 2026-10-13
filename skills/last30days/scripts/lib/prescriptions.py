@@ -329,6 +329,34 @@ REGISTRY: Dict[Tuple[str, str], Prescription] = dict((
         fix_cli="XIAOHONGSHU_API_BASE=http://your-host:18060  # only for a custom host; leave unset to auto-probe localhost and host.docker.internal",
         anchor="api-keys-env",
     ),
+    _entry(
+        "weixin", "unconfigured",
+        cause="weixin is opt-in and not in INCLUDE_SOURCES",
+        fix_nl=(
+            "add weixin to INCLUDE_SOURCES, or pass --search weixin / "
+            "--weixin-sources='账号名'. Public Sogou search only; do not paste "
+            "WeChat login cookies"
+        ),
+        fix_cli="INCLUDE_SOURCES=weixin  # optional: WEIXIN_SOURCES=机器之心,量子位",
+        anchor="api-keys-env",
+    ),
+    _entry(
+        "bilibili", "unconfigured",
+        cause="bilibili is opt-in and not in INCLUDE_SOURCES",
+        fix_nl="add bilibili to INCLUDE_SOURCES, or pass --search bili",
+        fix_cli="INCLUDE_SOURCES=bilibili",
+        anchor="api-keys-env",
+    ),
+    _entry(
+        "grounding", "crawl4ai_missing",
+        cause="LAST30DAYS_CRAWL4AI is set but crwl/crawl4ai is not installed",
+        fix_nl=(
+            "install crawl4ai (pipx install crawl4ai) so grounding snippets can "
+            "be enriched, or unset LAST30DAYS_CRAWL4AI"
+        ),
+        fix_cli="pipx install crawl4ai  # or LAST30DAYS_CRAWL4AI=  to disable",
+        anchor="api-keys-env",
+    ),
 ))
 
 
