@@ -103,9 +103,17 @@ These variables configure the local Go MCP server and are read from its process 
 
 | Env var | Default | Accepted values | Behavior and precedence |
 |---|---|---|---|
-| `LAST30DAYS_PYTHON` | unset | An executable name or path | Selects the Python 3.12+ interpreter used by the MCP server. A caller-supplied `RunOptions.PythonPath` remains the test/caller override; otherwise this variable must resolve to an executable. When it is unset, the server looks up `python3` on `PATH`. An empty or unresolvable value is an error rather than a fallback. |
+| `LAST30DAYS_PYTHON` | unset | An executable name or path | Selects the Python 3.12+ interpreter used by the MCP server. A caller-supplied `RunOptions.PythonPath` remains the test/caller override; otherwise this variable must resolve to an executable. When it is unset, the server discovers and version-probes compatible Python executables in absolute `PATH` directories. An empty or unresolvable value is an error rather than a fallback. |
 | `LAST30DAYS_MCP_ALLOW_BROWSER_COOKIES` | unset (deny) | `1`, `true`, `yes`, or `on`, case-insensitive | A recognized truthy value removes the MCP layer's default `--no-browser-cookies` flag. Every other value keeps that denial. This switch grants no consent by itself: browser-cookie access still requires the engine's separately recorded consent and `FROM_BROWSER` configuration. |
 | `LAST30DAYS_MCP_TIMEOUT` | `600` seconds (10 minutes) | A positive Go duration such as `10m`, `90s`, or `1m30s`, or a positive integer number of seconds such as `600` | Caps each research subprocess. The default accommodates deep discovery enrichment. Invalid, zero, and negative values use the default. An explicit caller timeout takes precedence. Source and enrichment deadlines can finish earlier; increasing this cap also extends how long a hung subprocess can occupy an MCP slot. |
+
+### MCP Python interpreter
+
+The MCP server requires Python 3.12 or newer within Python 3. It checks executable candidates in absolute `PATH` directories, in directory order: `python3`, versioned `python3.N` names from newest to oldest, then `python`. Windows `.exe` names are supported. Each candidate is version-probed before research starts; an old or unusable default does not hide a compatible interpreter later on `PATH`. Relative and empty `PATH` entries are ignored.
+
+Set `LAST30DAYS_PYTHON` in the MCP server process environment to pin a compatible executable, including one outside `PATH`, for example `/absolute/path/to/python3.12`. It accepts an absolute path or a command name resolving through `PATH` to an absolute executable. A missing, old, or invalid explicit choice produces an error without automatic fallback. This variable is read by the Go launcher, so setting it only in the Python engine's `.env` file cannot select the launcher interpreter.
+
+Discovery has a five-second total budget and a two-second limit per version probe. The research timeout is separate. Embedded Go callers retain the trusted `RunOptions.PythonPath` override for custom interpreters and test doubles. This selection does not add Python 3.9 support or install Python automatically.
 
 ## API keys (`.env`)
 
@@ -186,6 +194,13 @@ python3 skills/last30days/scripts/last30days.py "MCP servers" \
 
 **Reddit keyless pacing.** Unauthenticated reddit.com requests (site search, listing partials, shreddit) share one token bucket. The default is `1` request per second with a burst of 2, slow enough that engine fan-out does not trip HTTP 429 on a typical home IP. Set `LAST30DAYS_REDDIT_KEYLESS_RATE` to a float req/sec to trade wall-clock for coverage: higher finishes faster and loses more sub-requests to 429; lower is safer and slower. Invalid or non-positive values fall back to `1`. A 429'd search or listing sub-request is retried once after a short jittered pause, still through the limiter. Identical reddit.com requests within one command (subreddit listings, listing feeds, comment pages, which repeat across subqueries) are fetched once and memoized, so a typical four-subquery run issues roughly a quarter of the requests it used to. Comment enrichment covers 4 / 8 / 12 threads per subquery at quick / default / deep depth. This does not change ScrapeCreators routing (`LAST30DAYS_REDDIT_BACKEND` / `LAST30DAYS_REDDIT_SC_MIN_ITEMS`).
 
+**YouTube proxy.** Set `YOUTUBE_PROXY` (or the shorter alias `YT_PROXY`) to route all yt-dlp traffic through a proxy. Useful when YouTube is blocked in your region. Accepts any proxy URL that yt-dlp supports: `socks5://127.0.0.1:1080`, `http://proxy.example.com:3128`, etc. `YOUTUBE_PROXY` takes precedence over `YT_PROXY`. Only yt-dlp calls are routed through this proxy — other HTTP requests the skill makes (ScrapeCreators, OpenAI, etc.) are unaffected. To route all traffic, use the standard `HTTP_PROXY` / `HTTPS_PROXY` environment variables instead.
+
+```bash
+# In .env or environment
+YOUTUBE_PROXY=socks5://127.0.0.1:1080
+```
+
 **YouTube transcript tuning.** `LAST30DAYS_YT_SUB_LANGS` controls the comma-separated caption-language priority passed to yt-dlp and defaults to `en,es,pt`. The ScrapeCreators transcript fallback tries at most the first three distinct languages in that order, with a shared 30-second deadline per video; it stops after the first usable transcript. `LAST30DAYS_YT_PLAYER_CLIENT` defaults to `android` so yt-dlp can pass YouTube's web bot-gate without cookies (search, transcripts, and comments); set it empty to disable. When `SCRAPECREATORS_API_KEY` is available, yt-dlp uses one fast attempt before the paid fallback; set `LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT` to the number of seconds allowed for that attempt when a throttled host needs longer than the 12-second default. A VTT completed before the timeout is reused rather than discarded. `LAST30DAYS_YT_SEARCH_TIMEOUT` sets the per-search yt-dlp deadline (default 120s). Comparison-mode fan-out also caps concurrent yt-dlp processes process-wide and caches identical searches within a run so redundant `ytsearch` calls do not self-throttle the same IP.
 
 **YouTube search backfill.** With `SCRAPECREATORS_API_KEY` set, `LAST30DAYS_YT_SC_MIN_ITEMS` defaults to `3`: a yt-dlp search returning 0, 1, or 2 videos makes one ScrapeCreators search per stream attempt. Set `0` for the previous empty-only behavior, or another positive integer to change the floor. An invalid value behaves like `0`, so a typo does not increase paid usage. Each backfill can also fetch transcripts for up to 6 videos at default depth (up to 3 language requests per video); endpoint retries and optional comment enrichment can add calls. A later thin-source retry may run another backfill. Free results and their transcripts remain in the merged result. A clean thin result records backfill detail; actual yt-dlp or ScrapeCreators failures mark partial coverage if retry does not recover.
@@ -250,6 +265,12 @@ CT0=<your-ct0-token>
 # X_BEARER_TOKEN=<your-x-api-bearer-token>
 # OR xAI API key (paid)
 # XAI_API_KEY=<your-xai-key>
+# Optional: pin the xAI model (default: grok-4.20-0309-non-reasoning).
+# Set this if your key's model permissions don't include the default, or to
+# select a different available model from console.x.ai. It covers X search
+# only; the xAI planner and rerank models share the same default and are
+# pinned with LAST30DAYS_PLANNER_MODEL / LAST30DAYS_RERANK_MODEL.
+# LAST30DAYS_X_MODEL=grok-4.20-0309-non-reasoning
 # OR Xquik key-based X search
 # XQUIK_API_KEY=<your-xquik-key>
 # OR cookie-jar (free; logs in via your browser session).

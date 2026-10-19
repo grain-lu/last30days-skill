@@ -7,6 +7,8 @@ and pipeline._result_outcome_artifact mapped that error to a failed attempt.
 
 from unittest.mock import patch
 
+import pytest
+
 from lib import github, pipeline, schema
 
 
@@ -73,6 +75,27 @@ def test_noise_plus_qualifier_topic_is_clean_no_results_not_error():
 def test_quote_wrapped_qualifier_only_topic_is_clean_no_results_not_error():
     # Wrapper shapes from #952 still strip to nothing; #953 is the envelope.
     result, mock_fetch = _search('"created:>2025-03-20"')
+    mock_fetch.assert_not_called()
+    assert result["items"] == []
+    assert "error" not in result
+    artifact, bundle = _bundle_from_envelope(result)
+    assert artifact == {}
+    assert "github" not in bundle.errors_by_source
+    assert bundle.source_status["github"].state == schema.NO_RESULTS
+
+
+@pytest.mark.parametrize("topic", [
+    "(created:>2025-03-20",
+    "created:>2025-03-20)",
+    '(("created:>2025-03-20"))',
+    '[(("created:>2025-03-20"))',
+    "[is:issue",
+    "is:issue]",
+    "(created:>2025-03-20 [stars:>1000",
+    "[\u00a0created:>2025-03-20",
+])
+def test_malformed_wrapper_qualifier_only_topic_skips_network(topic):
+    result, mock_fetch = _search(topic)
     mock_fetch.assert_not_called()
     assert result["items"] == []
     assert "error" not in result
