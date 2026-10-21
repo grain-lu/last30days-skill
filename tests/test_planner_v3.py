@@ -433,6 +433,28 @@ class PlannerV3Tests(unittest.TestCase):
             self.assertNotIn("polymarket", all_sources,
                              f"polymarket should be excluded from {expected_intent}")
 
+    def test_explicit_requested_sources_survive_intent_routing(self):
+        """--search sources are a user override at default/deep depth too."""
+        for topic, requested, expected_intent in [
+            ("will the fed cut rates in december", ["hackernews", "polymarket"], "concept"),
+            ("how to deploy on Fly.io", ["reddit", "youtube", "polymarket", "stocktwits"], "how_to"),
+        ]:
+            for depth in ("default", "deep"):
+                with self.subTest(topic=topic, depth=depth):
+                    plan = planner.plan_query(
+                        topic=topic,
+                        available_sources=requested,
+                        requested_sources=requested,
+                        depth=depth,
+                        provider=None,
+                        model=None,
+                    )
+                    self.assertEqual(expected_intent, plan.intent)
+                    all_sources = set()
+                    for subquery in plan.subqueries:
+                        all_sources.update(subquery.sources)
+                    self.assertEqual(set(requested), all_sources)
+
     def test_opinion_includes_polymarket(self):
         """Polymarket should not be excluded from opinion intent plans."""
         plan = planner.plan_query(

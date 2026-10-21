@@ -211,8 +211,10 @@ def test_default_register_is_byte_identical_when_omitted(monkeypatch):
         # ## Source Errors in compact), and the comments pool reading every
         # floor-clearing cluster, and the canonical boundary's inline-citation
         # wording (no tool-contract override claim), and HN cluster-evidence
-        # comment lines carrying the comment's own link.
-        "946f97c3c37cca4dc8f2d687482ea510fb240a2b51587cc2dde19d33a768636b"
+        # comment lines carrying the comment's own link, and #706's fenced
+        # text footer, and #1082's removal of LAW N framing from model-visible
+        # contract text.
+        "7f59fe51a42de2983cc5ef863c03090f7c73d2a2e5adcea236883f14fe550ef5"
     )
 
 

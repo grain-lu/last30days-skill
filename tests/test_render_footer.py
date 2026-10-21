@@ -320,3 +320,22 @@ def test_raw_results_only_footer_includes_freshness_line():
     assert "🕒" in text
     assert "no usable dated evidence" in text
     assert "Raw results saved to /tmp/l30d-scratch/topic-raw.md" in text
+
+
+def test_saved_raw_file_footer_is_fenced():
+    """A bare footer ends its tree row directly above ``---``, which CommonMark
+    reads as a Setext heading underline in the saved raw Markdown file."""
+    report = _report(
+        items_by_source={"reddit": [_reddit_item()]},
+        source_status={
+            "reddit": schema.SourceOutcome(source="reddit", state=health.OK, items_returned=1),
+        },
+    )
+
+    text = render.render_full(report, save_path="/tmp/l30d-scratch/topic-raw.md")
+    footer = text[text.index("✅ All agents reported back!") - len("```text\n---\n") :]
+
+    assert footer.startswith("```text\n---\n✅ All agents reported back!\n")
+    assert footer.rstrip("\n").endswith(
+        "└─ 📎 Raw results saved to /tmp/l30d-scratch/topic-raw.md\n---\n```"
+    )

@@ -1748,7 +1748,7 @@ class TestYouTubeSearchTimeoutAndCache(unittest.TestCase):
         """A leader that outlives reset_search_cache must not drop the new slot."""
         import threading
 
-        key = ("ownership", 8, "2026-06-01")
+        key = ("ownership", 8, "2026-06-01", "2026-07-01", None)
         old_event = threading.Event()
         old_slot: list = [None]
         new_event = threading.Event()
@@ -1853,6 +1853,54 @@ class TestYtdlpPlayerClient(unittest.TestCase):
         self.assertEqual(youtube_yt._inject_youtube_player_client(cmd), cmd)
 
 
+class TestYoutubeProxy(unittest.TestCase):
+    """_ytdlp_proxy reads YOUTUBE_PROXY / YT_PROXY and _wrap_ytdlp_cmd injects it."""
+
+    def test_no_env_returns_none(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOUTUBE_PROXY", None)
+            os.environ.pop("YT_PROXY", None)
+            self.assertIsNone(youtube_yt._ytdlp_proxy())
+
+    def test_youtube_proxy_env(self):
+        with mock.patch.dict(os.environ, {"YOUTUBE_PROXY": "socks5://127.0.0.1:1080"}, clear=False):
+            os.environ.pop("YT_PROXY", None)
+            self.assertEqual(youtube_yt._ytdlp_proxy(), "socks5://127.0.0.1:1080")
+
+    def test_yt_proxy_alias(self):
+        with mock.patch.dict(os.environ, {"YT_PROXY": "http://proxy:3128"}, clear=False):
+            os.environ.pop("YOUTUBE_PROXY", None)
+            self.assertEqual(youtube_yt._ytdlp_proxy(), "http://proxy:3128")
+
+    def test_youtube_proxy_takes_precedence_over_yt_proxy(self):
+        with mock.patch.dict(os.environ, {"YOUTUBE_PROXY": "socks5://a:1", "YT_PROXY": "http://b:2"}, clear=False):
+            self.assertEqual(youtube_yt._ytdlp_proxy(), "socks5://a:1")
+
+    def test_empty_env_returns_none(self):
+        with mock.patch.dict(os.environ, {"YOUTUBE_PROXY": "   "}, clear=False):
+            os.environ.pop("YT_PROXY", None)
+            self.assertIsNone(youtube_yt._ytdlp_proxy())
+
+    def test_wrap_cmd_injects_proxy(self):
+        env_patch = {"YOUTUBE_PROXY": "socks5://127.0.0.1:1080"}
+        with mock.patch.dict(os.environ, env_patch, clear=False):
+            os.environ.pop("YT_PROXY", None)
+            os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+            cmd = ["yt-dlp", "--ignore-config", "ytsearch5:test", "--dump-json"]
+            result = youtube_yt._wrap_ytdlp_cmd(cmd)
+        self.assertIn("--proxy", result)
+        self.assertIn("socks5://127.0.0.1:1080", result)
+
+    def test_wrap_cmd_no_proxy_when_unset(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOUTUBE_PROXY", None)
+            os.environ.pop("YT_PROXY", None)
+            os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+            cmd = ["yt-dlp", "--ignore-config", "ytsearch5:test", "--dump-json"]
+            result = youtube_yt._wrap_ytdlp_cmd(cmd)
+        self.assertNotIn("--proxy", result)
+
+
 class TestYouTubeDateWindowByFreshnessMode(unittest.TestCase):
     """Out-of-window soft fallback is scoped to evergreen_ok (recent topics stay honest)."""
 
@@ -1874,13 +1922,13 @@ class TestYouTubeDateWindowByFreshnessMode(unittest.TestCase):
         ]
         return "\n".join(json.dumps(v) for v in videos)
 
-    def _search(self, dates, freshness_mode):
+    def _search(self, dates, freshness_mode, to_date=None):
         from lib.subproc import SubprocResult
         result = SubprocResult(returncode=0, stdout=self._ytdlp_stdout(dates), stderr="")
         with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
              mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=result):
             return youtube_yt.search_youtube(
-                "Ghostty terminal", self.FROM, self.TO, freshness_mode=freshness_mode,
+                "Ghostty terminal", self.FROM, to_date or self.TO, freshness_mode=freshness_mode,
             )
 
     def test_ytdlp_balanced_recent_with_no_in_range_videos_keeps_nothing(self):
@@ -1910,6 +1958,62 @@ class TestYouTubeDateWindowByFreshnessMode(unittest.TestCase):
         dates = ["2017-03-01", "2020-05-05"]
         self.assertEqual(len(self._search(dates, "evergreen_ok")["items"]), 2)
         self.assertEqual(self._search(dates, "balanced_recent")["items"], [])
+
+    def test_ytdlp_search_cache_separates_end_dates_in_both_orders(self):
+        dates = ["2026-10-01", self.TO, "2026-10-20"]
+        for end_dates in (("2026-10-01", self.TO), (self.TO, "2026-10-01")):
+            with self.subTest(end_dates=end_dates):
+                youtube_yt.reset_search_cache()
+                results = {
+                    end: self._search(dates, "evergreen_ok", to_date=end)
+                    for end in end_dates
+                }
+                self.assertEqual(
+                    {i["video_id"] for i in results["2026-10-01"]["items"]}, {"v0"},
+                )
+                self.assertEqual(
+                    {i["video_id"] for i in results[self.TO]["items"]}, {"v0", "v1"},
+                )
+
+    def test_ytdlp_inflight_searches_separate_end_dates(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from lib.subproc import SubprocResult
+
+        started = threading.Event()
+        release = threading.Event()
+        result = SubprocResult(
+            returncode=0,
+            stdout=self._ytdlp_stdout(["2026-10-01", self.TO, "2026-10-20"]),
+            stderr="",
+        )
+
+        def slow_first_search(*_args, **_kwargs):
+            if not started.is_set():
+                started.set()
+                self.assertTrue(release.wait(timeout=10), "first search was not released")
+            return result
+
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt.subproc, "run_with_timeout", side_effect=slow_first_search), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                youtube_yt.search_youtube, "Ghostty terminal", self.FROM, "2026-10-01",
+                freshness_mode="evergreen_ok",
+            )
+            try:
+                self.assertTrue(started.wait(timeout=5), "first search did not start")
+                second = pool.submit(
+                    youtube_yt.search_youtube, "Ghostty terminal", self.FROM, self.TO,
+                    freshness_mode="evergreen_ok",
+                )
+                later = second.result(timeout=5)
+            finally:
+                release.set()
+            earlier = first.result(timeout=5)
+
+        self.assertEqual({i["video_id"] for i in earlier["items"]}, {"v0"})
+        self.assertEqual({i["video_id"] for i in later["items"]}, {"v0", "v1"})
 
     def test_search_and_transcribe_threads_freshness_mode(self):
         from lib.subproc import SubprocResult
@@ -1956,6 +2060,18 @@ class TestYouTubeDateWindowByFreshnessMode(unittest.TestCase):
     def test_sc_unknown_mode_keeps_todays_soft_fallback(self):
         out = self._sc_search(["2017-03-01", "2020-05-05"], None)
         self.assertEqual({i["video_id"] for i in out["items"]}, {"s0", "s1"})
+
+    def test_ytdlp_drops_videos_published_after_window_end(self):
+        # --as-of window: videos uploaded after TO are neither in range nor a fallback.
+        dates = ["2026-10-20", "2026-11-01", "2026-12-01", "2026-10-01", "2017-03-01", self.TO]
+        out = self._search(dates, "evergreen_ok")
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"v3", "v4", "v5"})
+
+    def test_sc_drops_videos_published_after_window_end(self):
+        out = self._sc_search(
+            ["2026-10-20", "2026-11-01", "2026-12-01", "2017-03-01", self.TO], "evergreen_ok",
+        )
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"s3", "s4"})
 
 
 if __name__ == "__main__":

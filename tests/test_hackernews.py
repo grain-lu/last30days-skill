@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -616,6 +616,175 @@ def test_pipeline_hackernews_reports_failed_comment_enrichment(
     assert "_source_outcome" not in artifact
     assert "2 sub-requests rate-limited (HTTP 429)" in artifact["_source_outcome_detail"]
     assert artifact["_source_outcome_detail_state"] == schema.RATE_LIMITED
+
+
+# === HN kids ordering (#1285) ===
+
+
+@patch("lib.hackernews.http.request")
+def test_fetch_item_comments_orders_by_firebase_kids(mock_request):
+    """Quoted comments follow HN thread order, not Algolia child / id order."""
+
+    def fake_request(method, url, **kwargs):
+        if url.startswith(hackernews.FIREBASE_ITEM_URL):
+            # HN ranks B then A then C; Algolia listed them A, B, C (id order).
+            return {"kids": [2, 1, 3]}
+        if url.startswith(hackernews.ALGOLIA_ITEM_URL):
+            return {
+                "children": [
+                    {"id": 1, "author": "alice", "text": "<p>First posted.</p>", "points": None},
+                    {"id": 2, "author": "bob", "text": "<p>Top-ranked reply.</p>", "points": None},
+                    {"id": 3, "author": "carol", "text": "<p>Third.</p>", "points": None},
+                ]
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    mock_request.side_effect = fake_request
+    result = hackernews._fetch_item_comments("50019911", max_comments=2)
+
+    assert [c["author"] for c in result["comments"]] == ["bob", "alice"]
+    assert result["comments"][0]["url"] == "https://news.ycombinator.com/item?id=2"
+
+
+@patch("lib.hackernews.http.request")
+def test_fetch_item_comments_falls_back_to_points_when_kids_unavailable(mock_request):
+    """If the Firebase kids fetch fails, keep the previous points ordering."""
+
+    def fake_request(method, url, **kwargs):
+        if url.startswith(hackernews.FIREBASE_ITEM_URL):
+            raise hackernews.http.HTTPError("firebase down", status_code=503)
+        return {
+            "children": [
+                {"id": 1, "author": "alice", "text": "low", "points": 1},
+                {"id": 2, "author": "bob", "text": "high", "points": 9},
+            ]
+        }
+
+    mock_request.side_effect = fake_request
+    result = hackernews._fetch_item_comments("123", max_comments=2)
+    assert [c["author"] for c in result["comments"]] == ["bob", "alice"]
+
+
+def test_order_comments_by_kids_appends_unknowns():
+    comments = [
+        {"id": 1, "author": "a"},
+        {"id": 2, "author": "b"},
+        {"id": 99, "author": "extra"},
+    ]
+    ordered = hackernews._order_comments_by_kids(comments, [2, 1])
+    assert [c["id"] for c in ordered] == [2, 1, 99]
+
+
+@patch("lib.http.time.sleep")
+@patch("lib.http.urllib.request.urlopen")
+def test_firebase_kids_failure_stays_out_of_failure_sink(mock_urlopen, _mock_sleep):
+    """A Firebase outage keeps the Algolia comments and records no run failure."""
+    import urllib.error
+
+    from lib import http as lib_http
+
+    algolia_body = json.dumps({
+        "children": [
+            {"id": 1, "author": "alice", "text": "low", "points": 1},
+            {"id": 2, "author": "bob", "text": "high", "points": 9},
+        ]
+    }).encode("utf-8")
+    firebase_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url
+        if url.startswith(hackernews.FIREBASE_ITEM_URL):
+            firebase_calls.append(url)
+            raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, None)
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = algolia_body
+        response.status = 200
+        return response
+
+    mock_urlopen.side_effect = fake_urlopen
+    with lib_http.capture_failures() as failures:
+        result = hackernews._fetch_item_comments("123", max_comments=2)
+
+    assert firebase_calls
+    assert failures == []
+    assert [c["author"] for c in result["comments"]] == ["bob", "alice"]
+
+
+
+@pytest.mark.parametrize("firebase_read", ["incomplete", "non_utf8"])
+@patch("lib.http.time.sleep")
+@patch("lib.http.urllib.request.urlopen")
+def test_firebase_kids_unwrapped_read_errors_fall_back(mock_urlopen, _mock_sleep, firebase_read):
+    """A truncated or undecodable Firebase body keeps the Algolia comments."""
+    import http.client
+
+    from lib import http as lib_http
+
+    algolia_body = json.dumps({
+        "children": [
+            {"id": 1, "author": "alice", "text": "low", "points": 1},
+            {"id": 2, "author": "bob", "text": "high", "points": 9},
+        ]
+    }).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None):
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.status = 200
+        if req.full_url.startswith(hackernews.FIREBASE_ITEM_URL):
+            if firebase_read == "incomplete":
+                response.read.side_effect = http.client.IncompleteRead(b'{"kids": [1')
+            else:
+                response.read.return_value = b"\xff\xfe"
+        else:
+            response.read.return_value = algolia_body
+        return response
+
+    mock_urlopen.side_effect = fake_urlopen
+    with lib_http.capture_failures() as failures:
+        result = hackernews._fetch_item_comments("123", max_comments=2)
+
+    assert failures == []
+    assert [c["author"] for c in result["comments"]] == ["bob", "alice"]
+
+
+
+@patch("lib.http.time.sleep")
+@patch("lib.http.urllib.request.urlopen")
+def test_firebase_kids_timeouts_are_bounded(mock_urlopen, _mock_sleep):
+    """A hanging Firebase gets a short retry budget, not the default five attempts."""
+    from lib import http as lib_http
+
+    algolia_body = json.dumps({
+        "children": [
+            {"id": 1, "author": "alice", "text": "low", "points": 1},
+            {"id": 2, "author": "bob", "text": "high", "points": 9},
+        ]
+    }).encode("utf-8")
+    firebase_timeouts = []
+
+    def fake_urlopen(req, timeout=None):
+        if req.full_url.startswith(hackernews.FIREBASE_ITEM_URL):
+            firebase_timeouts.append(timeout)
+            raise TimeoutError("timed out")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.status = 200
+        response.read.return_value = algolia_body
+        return response
+
+    mock_urlopen.side_effect = fake_urlopen
+    with lib_http.capture_failures() as failures:
+        result = hackernews._fetch_item_comments("123", max_comments=2)
+
+    assert 1 <= len(firebase_timeouts) <= hackernews.FIREBASE_KIDS_RETRIES
+    assert all(t <= hackernews.FIREBASE_KIDS_TIMEOUT for t in firebase_timeouts)
+    assert failures == []
+    assert [c["author"] for c in result["comments"]] == ["bob", "alice"]
 
 
 if __name__ == "__main__":
