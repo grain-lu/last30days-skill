@@ -104,6 +104,12 @@ class _Hermetic:
         self._patches = [
             mock.patch("lib.health.probe_dependency", _probe_dep(probe_map, default_status)),
             mock.patch("lib.env.is_ytdlp_available", return_value=ytdlp_ok),
+            # env.is_ytdlp_available() is a thin wrapper over
+            # youtube_yt.is_ytdlp_installed(). Newer keyless-fallback probes
+            # (is_shortform_oss_available) call the youtube_yt symbol directly,
+            # so pin that one too or the result depends on whether the host
+            # actually has yt-dlp on PATH.
+            mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=ytdlp_ok),
             mock.patch("lib.bird_x.is_bird_installed", return_value=False),
             mock.patch("lib.bird_x.set_credentials", lambda *a, **k: None),
             mock.patch("lib.bird_x.get_bird_status", return_value=dict(BIRD_STATUS_OFF)),
