@@ -24,7 +24,7 @@ metadata:
         - PERPLEXITY_API_KEY
         - PARALLEL_API_KEY
         - BRAVE_API_KEY
-        - APIFY_API_TOKEN
+        - TINYFISH_API_KEY
         - AUTH_TOKEN
         - CT0
         - BSKY_HANDLE
@@ -238,7 +238,7 @@ After the response and required citations, stop and wait unless governing instru
 - Sogou Weixin search only on `--weixin-sources`/`INCLUDE_SOURCES=weixin` (public, no login cookie)
 - Sends search queries to Polymarket Gamma API (`gamma-api.polymarket.com`) for prediction market discovery (free, no auth)
 - Runs `yt-dlp` locally for YouTube search and transcript extraction (no API key, public data)
-- Sends TikTok/Instagram search, YouTube search backfill below the configured floor (default 3; `LAST30DAYS_YT_SC_MIN_ITEMS=0` means empty-only), and transcripts to ScrapeCreators (`api.scrapecreators.com`); keyed calls spend credits (10,000 free, then PAYG).
+- Sends TikTok/Instagram search, YouTube search backfill below the configured floor (default 3; `LAST30DAYS_YT_SC_MIN_ITEMS=0` means empty-only), and transcripts to ScrapeCreators (`api.scrapecreators.com`); keyed calls spend credits (10,000 free, then PAYG). When the ScrapeCreators key is missing or returns HTTP 402, TikTok/Instagram fall back to web discovery (SearXNG / TinyFish / Serper / Exa / Brave / keyless) plus `yt-dlp` per-post extract.
 - Optionally sends search queries to Brave Search API, Parallel AI API, Perplexity API (`api.perplexity.ai`), or OpenRouter API for web search / synthesis
 - Fetches public Reddit thread data from `reddit.com` for engagement metrics
 - Stores research findings in local SQLite database (watchlist mode only)
@@ -251,11 +251,11 @@ After the response and required citations, stop and wait unless governing instru
 - Does not post, like, or modify content on any platform
 - Does not access browser cookies unless explicitly configured or consented (`FROM_BROWSER`, manual X cookies, or setup with `--allow-browser-cookies`); `--preflight` and `--diagnose` do not read browser-cookie values
 - Does not use Codex ChatGPT auth as an OpenAI provider credential
-- Does not share API keys between providers, except the TikTok legacy fallback: when `SCRAPECREATORS_API_KEY` is unset, `APIFY_API_TOKEN` is sent to ScrapeCreators (`get_tiktok_token` in `scripts/lib/env.py`)
+- Does not share API keys between providers
 - Does not log, cache, or write API keys to output files
 - Endpoint destinations follow configured provider base URLs; `--preflight` reports active and ignored endpoint overrides without printing secrets
 - Hacker News and Polymarket sources are always available (no API key, no binary dependency)
-- TikTok and Instagram sources require SCRAPECREATORS_API_KEY (10,000 free calls, then PAYG). With the key set, Reddit spends ScrapeCreators credits on search backfill when the free path returns fewer than 5 items (default); `LAST30DAYS_REDDIT_SC_MIN_ITEMS=0` limits that to empty runs, and `LAST30DAYS_REDDIT_BACKEND=scrapecreators` makes ScrapeCreators primary.
+- TikTok and Instagram prefer SCRAPECREATORS_API_KEY (10,000 free calls, then PAYG) and fall back to `yt-dlp` plus a web-discovery backend (SearXNG via `LAST30DAYS_SEARXNG_URL`, TinyFish via `TINYFISH_API_KEY`, or Serper/Exa/Brave, or the keyless floor) when that key is missing or 402s. With the key set, Reddit spends ScrapeCreators credits on search backfill when the free path returns fewer than 5 items (default); `LAST30DAYS_REDDIT_SC_MIN_ITEMS=0` limits that to empty runs, and `LAST30DAYS_REDDIT_BACKEND=scrapecreators` makes ScrapeCreators primary.
 - Agent hosts invoke the slash-command skill contract; if `--agent` appears in the user's slash-command arguments, treat it as skill-level mode guidance, not a Python CLI flag.
 
 **Bundled scripts:** `scripts/last30days.py` (main research engine), `scripts/lib/` (search, enrichment, rendering modules), `scripts/lib/vendor/bird-search/` (vendored X search client, MIT licensed)

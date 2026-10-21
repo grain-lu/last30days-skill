@@ -5,6 +5,9 @@ engagement metrics (views, likes, comments), and fetch video transcripts.
 
 Requires SCRAPECREATORS_API_KEY in config. 100 free API calls, then PAYG.
 API docs: https://scrapecreators.com/docs
+
+When the key is missing or ScrapeCreators returns 402, search_and_enrich
+falls back to web discovery + yt-dlp (lib.shortform_oss).
 """
 
 import os
@@ -460,11 +463,13 @@ def search_and_enrich(
     depth: str = "default",
     token: str = None,
     ig_creators: List[str] | None = None,
+    config: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Full Instagram search: find reels, then fetch captions for top results.
 
     Uses expand_instagram_queries() to generate multiple search queries,
     runs ScrapeCreators for each, and merges/deduplicates results by video ID.
+    Falls back to web discovery + yt-dlp when the key is missing or 402s.
 
     Args:
         topic: Search topic (raw topic, not planner's narrowed query)
@@ -473,11 +478,13 @@ def search_and_enrich(
         depth: 'quick', 'default', or 'deep'
         token: ScrapeCreators API key
         ig_creators: Optional list of Instagram creator handles to fetch reels from
+        config: Optional env config (discovery keys for the OSS fallback)
 
     Returns:
         Dict with 'items' list. Each item has a 'caption_snippet' field.
     """
-    core_topic = _extract_core_subject(topic)
+    from . import shortform_oss
+
     seen_ids: Set[str] = set()
     items: List[Dict[str, Any]] = []
     last_error = None
@@ -486,7 +493,7 @@ def search_and_enrich(
     if ig_creators and token:
         for creator in ig_creators:
             raw_items = _user_reels(creator, token)
-            parsed = _parse_items(raw_items, core_topic)
+            parsed = _parse_items(raw_items, _extract_core_subject(topic))
             for item in parsed:
                 vid = item.get("video_id", "")
                 if vid and vid not in seen_ids:
@@ -494,32 +501,47 @@ def search_and_enrich(
                     items.append(item)
 
     # Step 1: Multi-query keyword search — run ScrapeCreators for each expanded query
-    queries = expand_instagram_queries(topic, depth)
-    for q in queries:
-        search_result = search_instagram(q, from_date, to_date, depth, token)
-        if search_result.get("error"):
-            last_error = search_result["error"]
-        for item in search_result.get("items", []):
-            vid = item.get("video_id", "")
-            if vid and vid not in seen_ids:
-                seen_ids.add(vid)
-                items.append(item)
+    if token:
+        queries = expand_instagram_queries(topic, depth)
+        for q in queries:
+            search_result = search_instagram(q, from_date, to_date, depth, token)
+            if search_result.get("error"):
+                last_error = search_result["error"]
+            for item in search_result.get("items", []):
+                vid = item.get("video_id", "")
+                if vid and vid not in seen_ids:
+                    seen_ids.add(vid)
+                    items.append(item)
 
     # Sort merged results by views descending
     items.sort(key=lambda x: x.get("engagement", {}).get("views") or 0, reverse=True)
 
+    from_oss = False
+    if not items and (not token or shortform_oss.credits_exhausted(last_error)):
+        cfg = config
+        if cfg is None:
+            from . import env as envmod
+            cfg = envmod.get_config()
+        oss = shortform_oss.search(
+            "instagram", topic, from_date, to_date, depth, cfg,
+        )
+        items = oss.get("items") or []
+        from_oss = bool(items)
+        if from_oss:
+            last_error = None
+        elif not last_error:
+            last_error = oss.get("error")
+
     if not items:
         return {"items": [], "error": last_error}
 
-    # Step 2: Fetch captions for top N
-    captions = fetch_captions(items, token, depth)
-
-    # Step 3: Attach captions to items
-    for item in items:
-        vid = item["video_id"]
-        caption = captions.get(vid)
-        if caption:
-            item["caption_snippet"] = caption
+    if not from_oss:
+        captions = fetch_captions(items, token, depth)
+        for item in items:
+            vid = item["video_id"]
+            caption = captions.get(vid)
+            if caption:
+                item["caption_snippet"] = caption
 
     return {"items": items, "error": last_error}
 
