@@ -14,6 +14,8 @@ from lib import grok_x
     "grok 1.0.46 (unknown) [stable]",
     "grok 1.0.46 (2765805b9442) [beta]",
     "grok 1.0.46-dev (modified)",
+    "grok 1.0.62 (unknown) [stable]",
+    "grok 1.0.62 (1474f9cbdd91) [beta]",
     "unexpected version output",
     "",
 ])
@@ -59,6 +61,8 @@ def test_failed_version_check_never_stages_credentials(monkeypatch, failure):
 @pytest.mark.parametrize("version", [
     "grok 1.0.46 (2765805b9442)",
     "grok 1.0.46 (2765805b9442) [stable]",
+    "grok 1.0.62 (1474f9cbdd91)",
+    "grok 1.0.62 (1474f9cbdd91) [stable]",
 ])
 def test_audited_build_runs_x_with_only_staged_auth(monkeypatch, tmp_path, version):
     store = tmp_path / ".grok" / "auth.json"

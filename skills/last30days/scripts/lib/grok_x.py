@@ -761,6 +761,11 @@ _ALLOWED_TOOLS = frozenset({
 _AUDITED_CLI_BUILDS = frozenset({
     "grok 1.0.46 (2765805b9442)",
     "grok 1.0.46 (2765805b9442) [stable]",
+    # Local audit 2026-10-20: forced read_file/shell/Agent calls refused, canaries
+    # outside and inside the child HOME unread, hosted x_keyword_search returned
+    # window-valid posts.
+    "grok 1.0.62 (1474f9cbdd91)",
+    "grok 1.0.62 (1474f9cbdd91) [stable]",
 })
 
 # Grok rejects an initially empty toolConfig when injection is disabled. Declare
@@ -870,8 +875,8 @@ def _check_cli_version(binary: str, workdir: str, timeout: float) -> Optional[st
         return f"grok CLI version check exited {result.returncode}"
     if result.stdout.strip() not in _AUDITED_CLI_BUILDS:
         return (
-            "unsupported grok CLI version; X research requires the audited "
-            "Grok 1.0.46 stable build (2765805b9442). "
+            "unsupported grok CLI version; X research requires an audited "
+            "Grok 1.0.46 (2765805b9442) or 1.0.62 (1474f9cbdd91) stable build. "
             "Use another X backend until your CLI build is supported."
         )
     return None
