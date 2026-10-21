@@ -620,6 +620,8 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_RERANK_MODEL', None),
         ('LAST30DAYS_X_MODEL', None),
         ('LAST30DAYS_X_BACKEND', None),
+        # Local tool-boundary audit of unlisted grok builds (grok_x.py); "off" disables.
+        ('LAST30DAYS_GROK_AUTO_AUDIT', None),
         ('LAST30DAYS_REDDIT_BACKEND', None),
         # Keyless reddit.com token-bucket rate (req/sec). http.py reads it
         # from os.environ on each acquire, so .env values are exported below.
@@ -812,9 +814,10 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     if config.get('LAST30DAYS_DEBUG'):
         os.environ.setdefault('LAST30DAYS_DEBUG', config['LAST30DAYS_DEBUG'])
 
-    # youtube_yt reads these tuning knobs lazily from os.environ, so values
+    # youtube_yt and grok_x read these knobs lazily from os.environ, so values
     # loaded from .env must be exported into the current engine process.
     for key in (
+        'LAST30DAYS_GROK_AUTO_AUDIT',
         'LAST30DAYS_YT_SUB_LANGS',
         'LAST30DAYS_YT_TRANSCRIPT_FAST_TIMEOUT',
         'LAST30DAYS_YT_SEARCH_TIMEOUT',
