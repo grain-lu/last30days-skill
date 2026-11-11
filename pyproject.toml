@@ -1,6 +1,6 @@
 [project]
 name = "last30days-skill"
-version = "3.28.1"
+version = "3.34.1"
 description = "Multi-source last-30-days research skill"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -10,6 +10,7 @@ dependencies = []
 dev = [
   "pytest>=9.1.1,<10",
   "pytest-cov>=7,<8",
+  "pytest-xdist>=3.8,<4",
   "pyyaml>=6.0.2,<7",
   "towncrier>=25.8.0,<27",
 ]

@@ -9,6 +9,159 @@ This project uses [towncrier](https://towncrier.readthedocs.io/). Upcoming notes
 
 <!-- towncrier release notes start -->
 
+## [3.34.1] - 2026-11-11
+
+### Fixed
+
+- A topic with no job board no longer reports "Jobs unreachable" and "Some sources failed: jobs". A careers domain guessed from the topic's name that does not resolve, or refuses the connection, now counts as no board found; a hiring system's own API being down is still reported.
+- Jobs now finds a company's board when its careers page is a landing page that links to a job search on the same site (`nvidia.com/careers` to `jobs.nvidia.com`), so a person who leads such a company gets that company's roles ("Jensen Huang" returned 0 jobs). When Wikidata names no company for the topic and the topic has no board of its own, the one company the host passed with `--ticker` is searched instead; without an official site its board still gives a digest only when the board names that company.
+- Polymarket footer names are whole phrases and carry the price of the market they name: "Waymo operate in 12-15 cities on Dec 31, 2026 79%" where the footer printed "Waymo operate in 12-15 cities on 79%", and a bracket's price is no longer shown beside another bracket's question. A deadline ladder ("... by December 31, 2026", "... by March 31, 2027") shows its nearest deadline that has not passed instead of the furthest. A market is named in the footer only when it names the whole topic, so a table tennis match no longer appears under "Jensen Huang". In the saved file, the outcomes of a multi-outcome event keep their own labels ("12-15: 79% | 16-19: 12%") instead of repeating the subject ("Waymo: 79% | Waymo: 12%").
+- The footer's freshness note ("Recent evidence is thin: only N of M dated items are from the last 7 days") no longer counts job postings. A company board with thousands of older postings made every company run look stale; the note now measures only what people posted.
+- The saved raw file no longer lists every posting on a company's job board (one run's file was 2.4 MB, 2.3 MB of it postings). It now carries the Jobs Digest, the ranked postings (up to 40) and a count of the rest.
+
+
+## [3.34.0] - 2026-11-11
+
+### Added
+
+- Company and person topics now resolve to the company they name through Wikidata, with or without a host plan and for each entity of a comparison: the company and its site when the match is certain, and its ticker only when it has exactly one primary listing. The Resolved Entities row shows the ticker, as `Ticker NVDA`, or `Ticker NVDA (via Nvidia)` when the topic is the person who leads it.
+- Company job boards hosted on Workday (Nvidia, for example) are now read. The listing is fetched in parallel under a time budget, up to Workday's 2,000-row limit, and the run records when a board was capped or cut short. Descriptions and true posted dates are fetched for a small number of roles only.
+- Company reports can now carry a "Jobs Page Secret Signals" section, built from the company's own job board. It appears only when at least two postings reveal something out of character, concrete and hard to undo, or bear on a story in the report, and each signal quotes and links its posting. A signal is called unreported only after a web check; most runs show no section. `--hiring-signals` runs need only one such signal.
+- Company topics get a Yahoo Finance footer line: the share-price change over the 30 days ending on the report's last day, whatever the research window, with both closes, the S&P 500 for US listings, and the largest single-day move. It appears when `yahoo-finance-pp-cli` is on PATH and the topic resolves to a listed company or the person who leads one; the same numbers are in the evidence as a Market Data block and add nothing to the item counts. `EXCLUDE_SOURCES=yahoo_finance` turns the line off with no call to Yahoo Finance, and adding `jobs` to that list also skips the Wikidata company lookup. When the Wikidata lookup fails, the topic text is sent to Yahoo Finance's symbol search as a fallback and its first stock is used only on an exact name match with a US symbol. The hosting model can now pass the ticker it found by web search with `--ticker "SYMBOL:Company"` (two pairs for a person who leads two listed companies), which also covers products and subsidiaries through their listed parent; the engine uses a pair only when Yahoo Finance's price chart and symbol search both agree with it, and prints no price line when none does.
+- First-run setup now installs the free, keyless Yahoo Finance CLI with the arXiv and Techmeme CLIs, under the same consent, so company topics get the share-price line without a separate install. Existing installs are not changed: `doctor` lists the source with its CLI and prints the install command when the binary is missing. The security notes now name the two calls behind the line: the topic text goes to Wikidata when it looks like a company or a person's name, and Yahoo Finance receives a ticker symbol and, to confirm one, the company name.
+
+### Changed
+
+- A story in the report can now be followed by one pulled comment on its own quote line, with the platform, author, community and vote count, translated when the comment is in another language. The `## Top Community Comments` evidence lines name the platform dot and, for Reddit, the subreddit, and print counts with thousands separators.
+- Job postings now reach the report as a `## Jobs Digest` evidence section in place of the opening lines of each description: up to 40 of the board's rarest roles, each with the text no other role on that board repeats. Two postings that share a title stay separate roles unless they also say the same thing, and a ranked posting the digest does not list keeps its own evidence line. The footer Jobs line reads `N open roles`, adds `M new in the L30` only when the board gives every role a true first-posted date (Greenhouse now uses `first_published`, not `updated_at`), and shows `2,000+` for a board that was capped or cut short, with no new-roles count for a board read in part. SmartRecruiters boards are read past their first 100 roles, up to 2,000. Workable postings now carry their published date, so a Workable board read whole gets a new-roles count, and a posting's departments read as names (`Product, Design`). Workday descriptions are fetched for the digest's roles only; a Workday board whose every role was fetched gets a new-roles count too, and the digest's note counts detail requests that failed. The MCP `research` tool returns the footer line without the digest (it sets `LAST30DAYS_NO_JOBS_DIGEST=1`), and job postings there keep their evidence lines.
+- Reports now end on the "I'm now an expert on…" invitation and its suggestions; the closing "I have all the links to the … I pulled from. Just ask." line is gone. Saved HTML briefs and the library feed still leave the invitation out, for reports with either ending, and now leave out the comparison invitation too.
+- The report's first line now names the search and its window: `🌐 last30days · {topic} · {Mon D} to {Mon D, YYYY} · v{VERSION}` replaces `🌐 last30days v{VERSION} · synced {YYYY-MM-DD}`. Comparison runs show the entities joined by " vs " and discovery runs show the domain.
+
+### Fixed
+
+- A normal run on a company, or on the person who leads one, reads that company's job board again: the research instructions now have the host name `jobs` in its plan, which they had told it to leave out. The board is looked for on the company's official site, and other domains are guessed only when no official site is known. A board found by guessing its name or its domain is used for the role count alone unless it names the same company, and a run with `--as-of` in the past skips Jobs with the reason shown.
+- GitHub keyword search no longer adds spam issues and passing mentions from unrelated repos to reports on non-tech topics. A result is kept only when its title names the topic or its repo is named for it; `--github-user` and `--github-repo` runs are unchanged.
+- Report paragraphs keep their bold headline phrase when you have a general plain-style or no-bold preference, so reports stay scannable. The headline is dropped only when an instruction names the report or arrives with the request, the host or operator requires it, or the channel does not render markdown.
+- The Polymarket footer line names each market once and whole: a sub-market's name is no longer cut mid-word or repeated after its question, and markets that differ only in their deadline are told apart.
+- The `## Stats` block no longer counts job postings as evidence: "Total evidence" and its source count leave them out, "Top voices" no longer lists departments or the hiring system, and open roles get their own `Jobs: N roles` line.
+- The web section appended to the saved raw file now keeps each article's URL instead of only the outlet's domain, so later readers and later runs can link the articles.
+
+
+## [3.33.2] - 2026-11-10
+
+### Fixed
+
+- X search no longer fails with "Internal server error" when an earlier browser holds an expired x.com session. With `FROM_BROWSER=auto`, if X rejects the session from the first browser that has one (for example an old Safari login), the engine retries the search with the next browser's session (for example Chrome) and keeps using it for the rest of the run. When no other browser has a working session, the error names the browser whose session failed and is reported as an auth failure.
+
+
+## [3.33.1] - 2026-11-10
+
+### Fixed
+
+- YouTube no longer comes back empty for topics with a big back catalog, such as a music artist whose top search results are years-old official videos. When the relevance search finds fewer than 3 videos inside a recent window, the engine retries once with YouTube's own upload-date filter (this week, month, or year) and merges the new uploads. An age-restricted video in the results is also no longer mistaken for a bot block, which had been cancelling transcripts for the whole search.
+
+
+## [3.33.0] - 2026-11-10
+
+### Security
+
+- Limit the Bright Data CLI child environment to its own API key and runtime, credential-location, TLS and proxy settings, preventing unrelated provider secrets from being inherited even when no explicit Bright Data key is configured.
+
+### Fixed
+
+- Instagram searches that find no reels now show `no results` in Source Coverage instead of `error: HTTP 404`. A 404 from the Google discovery fallback is treated as a clean miss, matching the primary reels search; other fallback failures are still reported. ([#1370](https://github.com/mvanhorn/last30days-skill/issues/1370))
+- Enablement topics such as "best Grok AI bot to control my computer agent" now plan as how-to research, with subqueries for the built-in route and the third-party MCP servers, CLIs and automation tools that give the named tool that capability, instead of a strict-recent comparison about the tool.
+- In Claude Code, reports no longer contain markdown lists: KEY PATTERNS numbers and suggestion bullets are written as plain lines that look the same. While a list streamed, Claude Code could redraw every link in the reply as `label (url)`, leaving the scrolled-off part of a report with visible URLs. Other hosts are unchanged.
+- Plural topics like "AI coding agents" or "prediction markets" are classified into their category again, so discovery and subreddit resolution add the category's peer subreddits instead of finding no category.
+- Questions such as "best Grok bot to control my computer" now surface the general tools that answer them (MCP servers, agent CLIs, browser automation), not only posts about the named tool. The planner always adds a search for the capability itself, also when the LLM planner is unavailable. The candidate pool keeps a few of those results, spread across sources. The reranker no longer caps them for not naming the tool the question names.
+- Recommendation reports use available source voices without requiring X posts, and their example follows the root output format.
+- Reports stop printing a like, upvote, view, or point count beside every quote and source. Engagement numbers still decide what gets quoted, but a count now appears in the summary only when its size is the finding (a comparison, a contrast, or a surprise); otherwise the report says "the top comment" or drops the number. Polymarket odds, the `creator` and `exec` registers, and the stats footer are unchanged.
+
+
+## [3.32.0] - 2026-11-09
+
+### Security
+
+- Keep synthesis, citation, and response-format instructions in the skill and MCP tool description rather than research output. Compact and comparison reports retain source evidence, coverage warnings, footer data, and structural boundaries without commands to override the host's response format.
+- Make explicit cookie refusal (`BROWSER_CONSENT=false` or `FROM_BROWSER=off`) disable the agentcookie sidecar as well as native browser and CDP reads, including availability checks. User-supplied credentials and sidecar behavior without an explicit refusal are unchanged.
+
+  Existing sidecar users with either refusal setting must remove both `BROWSER_CONSENT` and `FROM_BROWSER` from the process environment, the active global `.env` (including a custom `LAST30DAYS_CONFIG_DIR`), and any trusted project `.claude/last30days.env`, then set `AGENTCOOKIE=on` to restore sidecar-only access. Native browser and CDP reads remain disabled with both settings absent; `BROWSER_CONSENT=true` would also permit CDP reads.
+
+### Fixed
+
+- Accept query plans from standard input with `--plan -` and use a quoted heredoc in the research runbook, so Codex can start research without a temporary-plan cleanup trap. ([#1346](https://github.com/mvanhorn/last30days-skill/issues/1346))
+- Identify Google discovery fallback failures in Instagram search results and Source Coverage, preserving clean no-reels responses, recovered reels across queries or creators, and the most specific typed HTTP failure. ([#1356](https://github.com/mvanhorn/last30days-skill/issues/1356))
+- A YouTube lane keeps 60 to 75 seconds for transcripts before it starts another expanded search. After yt-dlp hits a bot-check or HTTP 429, including over SSH, the rest of that search's transcripts go to ScrapeCreators when a key is set, and a transcript cut off by the lane deadline is logged as that deadline.
+- Amazon research works again with Bright Data CLI 0.4.0 and newer, which removed the named pipeline commands the engine called. Older CLIs now get a clear upgrade message (`npm i -g @brightdata/cli@latest`).
+- Research on an organization whose first word names other things (for example "Pace Capital" vs. Pace Morby) no longer writes up the namesakes. The planner can now anchor such organizations by full name, anchored runs drop namesake items from the footer counts and Top voices too, and synthesis drops a different entity with the same name silently instead of noting it is unrelated.
+- X, Threads and planner searches no longer keep a question's closing "?" in the core subject: "What is Claude Code?" now searches for "claude code" instead of "claude code?", and a noise word or suffix right before the "?" is stripped as it is without one.
+- `--search` with only sources that can't run here (for example telegram or tiktok without a ScrapeCreators key) now names those sources and exits 2 instead of ending in a traceback.
+- `store.store_findings` now collapses duplicate URLs within a single batch and coalesces null engagement scores during conflict upserts so a single run never inflates `sighting_count` or `findings_updated` for a newly discovered URL.
+
+
+## [3.31.0] - 2026-10-27
+
+### Security
+
+- Fixed MCP research dispatch so reserved topic names cannot invoke administrative commands. Protected existing password-store credentials when decryption fails, and sanitized Digg-attached X quotes so external content cannot forge the engine's evidence boundaries.
+
+### Added
+
+- Browser-cookie auth now covers **Dia** (The Browser Company) on macOS, alongside the rest of the Chromium family. Use `FROM_BROWSER=dia`, or let `FROM_BROWSER=auto` find it. The first-run setup wizard also scans Dia, so a user whose only X session lives there is detected without setting `FROM_BROWSER` first.
+- Reddit comment enrichment now falls back to the arctic-shift archive when the shreddit comment partials return nothing — hosts on datacenter egress (where Reddit 403s `/svc/shreddit`) keep top-comment text (ranked by score) instead of silently degrading to counts only.
+
+### Fixed
+
+- Preserve explicit person identity anchors through plan replay, X entity expansion, and ranking so same-name evidence cannot become a supplemental target or ranked result. ([#1290](https://github.com/mvanhorn/last30days-skill/issues/1290))
+- TikTok searches now share a deadline across hashtags, creator videos, keyword searches, transcripts, and comments, returning collected videos as partial results instead of losing them at the stream timeout. ([#1311](https://github.com/mvanhorn/last30days-skill/issues/1311))
+- When the YouTube step times out, the footer now names the timeout instead of telling you to update yt-dlp. ([#1327](https://github.com/mvanhorn/last30days-skill/issues/1327))
+- YouTube no longer times out for every entity in "X vs Y vs Z" comparisons. Each entity now takes its share of a single-topic YouTube budget (searches, transcripts, and comments, at least one of each) instead of a full budget apiece, so the parallel sub-runs stop queueing several runs' worth of yt-dlp work on the shared two-slot limit and each one returns videos inside the 180-second lane wait. Single-topic runs are unchanged. ([#1335](https://github.com/mvanhorn/last30days-skill/issues/1335))
+- A YouTube lane that runs out of time now returns the videos it already found instead of being dropped as a timeout with zero results. Search, transcript, and comment fallbacks share the lane's return deadline, preserving time to hand back partial results. Expired lanes are not retried or backfilled, and no new paid fallback starts after their return deadline.
+- Classify ScrapeCreators Instagram reels-search 404 responses that explicitly report no matching reels as clean no-results, while preserving errors for other 404s and keeping Google discovery fallback. When the hashtag-form retry answers a reels-search 500, the replaced 500 no longer marks Instagram as failed. Fixes the Instagram portion of #1311.
+- Fixed cached HTML exports to respect research scope and support comparison exports after temporary plans are removed. Aligned MCP save destinations with preflight and trusted configuration, isolated comparison peers' dedicated subreddits, and honored jobs exclusions throughout source selection.
+
+  Kept rejected Polymarket markets out of ranking, restored enrichment-based entity grounding, selected the newest relevant freshness assertion, included the final requested day in Grok and Xquik searches, and restored Reddit fallback when ScrapeCreators results are all outside the requested window. Corrected non-Latin web-backend guidance and autoresolve backend availability.
+
+  Fixed signup credential persistence over empty configuration assignments, browser cookie snapshots with committed SQLite WAL changes, multipart Trustpilot hostnames, and Startpage snippet association. Preserved maximum observed engagement during concurrent updates.
+- GitHub source footers distinguish open issues/PRs, total PRs, and contributed PRs from discussion comments across compact, HTML, and comparison views. Genuine issue and PR comment counts remain discussion comments.
+- Grok X research works again on current grok CLI releases. Instead of accepting only grok 1.0.46, last30days accepts stable builds at 1.0.46 or newer and audits each new build once, locally, before it receives credentials: the build runs against a fake xAI endpoint on 127.0.0.1 with dummy credentials, signed in and with an API key, must declare hosted X search as its only tool, and must refuse a forced shell command and file read. The audit costs no credits and never contacts xAI. npm installs now run the native binary the package ships, which also skips a roughly 170 MB decompression on every grok call.
+- Keyless web results (DuckDuckGo, Startpage, SearXNG) no longer vanish because they carry no date: when the research window reaches today, undated keyless results are kept and labelled `date unknown [date:low]`. Historical windows still drop them, and keyed backends keep their existing date rules. Follow-up to #928 / #1038.
+- Reddit comment enrichment now stops the arctic-shift archive fallback at the shared enrichment budget instead of giving it a fresh 15 seconds, so a slow archive on a datacenter host can no longer hold up the rest of the research past that budget.
+- YouTube spends fewer ScrapeCreators credits on transcripts. Paid rescues of failed yt-dlp transcript fetches stop once they have filled the depth's transcript target instead of covering every candidate (up to three times the target). The search backfill counts transcripts yt-dlp already fetched toward that target. yt-dlp now requests every original-speech track (`en-orig`, `es-orig`, ...) before any plain language code, so a video dubbed from another language into English no longer stops at a rate-limited translated `en` track before reaching its original.
+
+
+## [3.30.0] - 2026-10-22
+
+### Fixed
+
+- Hosted runs now search installed lanes such as Digg even when the host's plan leaves them out, and stop printing "0 clusters" for sources that were never searched. Entity runs resolve the subject's X handle more reliably: `--official-site` reads the handle from the brand's homepage links with no API key, the runbook restricts X searches with the search tool's domain filter, and a hosted entity run that plans X now exits 2 until it passes `--x-handle` or `--no-x-handle="<reason>"`.
+
+
+## [3.29.0] - 2026-10-22
+
+### Security
+
+- Add a "Data handling" section to README in all 7 languages disclosing that reranking sends topics and content snippets to the configured reasoning provider when a key is set. Document `LAST30DAYS_STORE` retention, save-directory overrides, and how to purge a database and its WAL sidecars after stopping all users. Log the npm package name to stderr before each `npx` install, preserving machine-readable stdout. These disclosure changes do not add a rerank-disable option, automatic expiry, or a new installation-consent gate. ([#663](https://github.com/mvanhorn/last30days-skill/issues/663))
+
+### Added
+
+- `LAST30DAYS_YOUTUBE_BACKEND=yt-dlp` keeps YouTube on yt-dlp only, with the keyless retry budget, while `SCRAPECREATORS_API_KEY` keeps serving other sources. `LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS` sets how many keyed yt-dlp transcript attempts run before the paid fallback (default 1). ([#1316](https://github.com/mvanhorn/last30days-skill/issues/1316))
+
+### Fixed
+
+- Instagram keyword search falls back to a bounded Google-indexed reel search and fetches post details when the primary reels search returns no results. Recovery and enrichment share the source deadline, preserve completed results as partial coverage, and stop starting requests after timeout or cancellation. ([#1020](https://github.com/mvanhorn/last30days-skill/issues/1020))
+- Instagram nudge now distinguishes HTTP errors ("Bonus source failed: Instagram") from zero-result runs ("Bonus source unavailable: Instagram") instead of labelling both as "silent". ([#1289](https://github.com/mvanhorn/last30days-skill/issues/1289))
+- Updated the README source tables in all seven languages to include the engine's optional and local sources, with activation requirements. Replaced stale release and test counts with maintained references, and corrected source prerequisites in CONFIGURATION.md. ([#1303](https://github.com/mvanhorn/last30days-skill/issues/1303))
+- YouTube transcripts now request uploaded subtitles alongside auto captions, so videos with manual subtitles and no auto track get a free yt-dlp transcript instead of falling through to a paid ScrapeCreators rescue. ([#1313](https://github.com/mvanhorn/last30days-skill/issues/1313))
+- yt-dlp now asks for each caption language's original-speech track first (`en-orig,en,...`), so auto-dubbed videos whose plain track returns HTTP 429 keep a free transcript. The ScrapeCreators fallback sends plain language codes. ([#1314](https://github.com/mvanhorn/last30days-skill/issues/1314))
+- A YouTube lane still running after the research budget ran out no longer spends ScrapeCreators credits on search, transcripts, or comments, and an interpreter-shutdown error is no longer treated as an empty yt-dlp result. The ScrapeCreators YouTube search also stops buying transcripts once it reaches the depth's target. ([#1315](https://github.com/mvanhorn/last30days-skill/issues/1315))
+- Digg results work again with digg-pp-cli 2026.10.1, which rebuilt search after Digg removed its search API. last30days now searches Digg's AI and Tech sections, keeps an empty answer from a freshly synced copy as "no matches" instead of an error, and marks Digg partial in the brief, with the `digg-pp-cli sync --topics ai,tech` command to run, when the CLI searched only its newest stories.
+- Handle discovery no longer treats short fragments of a topic word (for example "go" for "Google Gemini") as the topic's subject, now recognizes handles spelled from a name's prefixes (for example "steipete" for "Peter Steinberger"), and no longer gives first-party status to accounts named after query scaffolding words like "review" or "news".
+- Keyless Reddit discovery no longer collapses to 1-point stubs when shreddit is blocked: the arctic-shift supplement now slices the research window with `after`/`before` and keeps the highest-scored sampled posts, restoring real engagement numbers (a 30-day window on the test topic went from 6pts to ~3,000pts). Slice requests rotate across subreddits so a slow first subreddit cannot consume the entire discovery budget, and successful partial results survive failed slices or an expired deadline.
+- Search-query cleanup now strips "how do you use", "how can I use", "how do you" and "how can I" openers, so "how do you use Cursor" searches for "cursor" instead of "do you cursor".
+- The deferred X relevance floor now runs before the per-source evidence view is finalized, so the report's X items and X source status count reflect the same post-floor evidence set that ranking sees.
+
+
 ## [3.28.1] - 2026-10-20
 
 ### Added

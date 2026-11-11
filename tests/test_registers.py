@@ -197,7 +197,11 @@ def test_creator_register_leads_markdown_and_html_with_best_takes():
 
 
 def test_default_register_is_byte_identical_when_omitted(monkeypatch):
-    monkeypatch.setattr(render, "_render_badge", lambda: ["fixed badge", ""])
+    monkeypatch.setattr(
+        render,
+        "_render_badge",
+        lambda topic, range_from, range_to: ["fixed badge", ""],
+    )
     monkeypatch.setattr(render, "_skill_version", lambda: "fixture")
     report = fixture_report()
 
@@ -213,8 +217,10 @@ def test_default_register_is_byte_identical_when_omitted(monkeypatch):
         # wording (no tool-contract override claim), and HN cluster-evidence
         # comment lines carrying the comment's own link, and #706's fenced
         # text footer, and #1082's removal of LAW N framing from model-visible
-        # contract text.
-        "7f59fe51a42de2983cc5ef863c03090f7c73d2a2e5adcea236883f14fe550ef5"
+        # contract text, then moving presentation commands out of the payload,
+        # and Top Community Comments lines naming the platform dot and subreddit,
+        # and job roles reported on their own Stats line, outside the total.
+        "bca898a092634775109f7c2f2bea3e29dc24cb064f64cbb5e1fb34f4747b8c36"
     )
 
 

@@ -27,6 +27,7 @@ from . import (
     bird_x,
     bluesky,
     brightdata,
+    company_resolve,
     corpus,
     dates,
     dedupe,
@@ -88,7 +89,7 @@ from . import (
 from .cluster import cluster_candidates
 from . import fusion
 from . import render
-from .fusion import collapse_duplicate_urls, weighted_rrf
+from .fusion import collapse_duplicate_urls, source_item_key, weighted_rrf
 
 DISCOVERY_SOURCES = ("reddit", "hackernews", "digg", "x")
 _DISCOVERY_GENERIC_DOMAIN_TERMS = {
@@ -155,6 +156,9 @@ STREAM_ARTIFACT_LIFT_KEYS: tuple[str, ...] = ("meta_ads_page", "meta_ads_tally")
 # Worst case per stream is one timeout ceiling (+ one inline 5xx retry in the
 # main fan-out, itself bounded by the lane's own timeouts); no new config knobs.
 STREAM_FUTURE_TIMEOUT_SECONDS = 180.0
+# A job board lists the roles open today, so it cannot answer a window that
+# ended in the past.
+JOBS_PAST_WINDOW_SKIP = "skipped: a job board shows the roles open today, not those of a past window"
 DISCOVERY_FUTURE_TIMEOUT_SECONDS = 60.0
 THIN_RETRY_FUTURE_TIMEOUT_SECONDS = 120.0
 # One X source, ordered backends: grok (up to 240s/call) + xai (90-180s) would
@@ -226,15 +230,7 @@ def _lift_stream_artifacts(bundle) -> None:
                 bundle.artifacts[key] = value
 
 
-_FAILURE_SPECIFICITY = {
-    health.AUTH_FAILED: 0,
-    health.PAYMENT_REQUIRED: 1,
-    health.RATE_LIMITED: 2,
-    health.SCHEMA_DRIFT: 3,
-    health.TIMEOUT: 4,
-    health.UNREACHABLE: 5,
-    health.ERROR: 6,
-}
+_FAILURE_SPECIFICITY = health.FAILURE_SPECIFICITY
 
 
 @dataclass
@@ -350,6 +346,10 @@ def normalize_requested_sources(sources: list[str] | None) -> list[str] | None:
         if key not in normalized:
             normalized.append(key)
     return normalized
+
+
+class NoRequestedSourceAvailable(RuntimeError):
+    """None of the sources the user asked for with --search is configured."""
 
 
 def available_sources(
@@ -691,7 +691,7 @@ def _fetch_discovery_source(
     if source == "digg":
         result = digg.search_digg(plan.domain, from_date, to_date, depth=depth)
         items = digg.parse_digg_response(result, query=plan.domain)
-        # Digg is an AI-focused broad listing, so keep only domain-bearing
+        # Digg's AI and Tech sections are a broad listing, so keep only domain-bearing
         # clusters when scoped; global trending keeps the whole feed.
         if keyword_gate:
             items = [
@@ -2278,6 +2278,7 @@ def run(
     # overlaps other sources instead of waiting for them all to finish.
     run_started = time.monotonic()
     from_date, to_date = dates.get_date_range(lookback_days, as_of_date=as_of_date)
+    jobs_past_window = to_date < dates.get_date_range(0)[1]
     resolved_corpus_dirs = corpus.resolve_directories(
         corpus_dirs or config.get("_CORPUS_DIRS"),
         config.get("LAST30DAYS_CORPUS_DIRS"),
@@ -2376,10 +2377,20 @@ def run(
         config["_hiring_signals_mode"] = True
         if not requested_sources:
             available = ["jobs"]
+    available = [source for source in available if source not in excluded_sources]
     if not available:
+        if requested_sources:
+            raise NoRequestedSourceAvailable(
+                "None of the sources in --search can run here: "
+                + ", ".join(requested_sources)
+                + ". Run `last30days.py doctor` to see what each one needs."
+            )
         raise RuntimeError("No sources are available for this run.")
 
-    planner_requested_sources = requested_sources
+    planner_requested_sources = (
+        [source for source in requested_sources if source not in excluded_sources]
+        if requested_sources else None
+    )
     if hiring_signals_mode and not planner_requested_sources:
         planner_requested_sources = ["jobs"]
 
@@ -2400,6 +2411,9 @@ def run(
             external_plan, topic, available, planner_requested_sources, depth,
             honor_plan_sources=True,
         )
+        # Quick runs keep the sanitizer's two-source budget.
+        if depth != "quick":
+            _ensure_unplanned_lanes_in_host_plan(plan, available)
         plan_source = "external"
     else:
         _check_research(config)
@@ -2484,6 +2498,7 @@ def run(
 
     bundle = schema.RetrievalBundle(artifacts={"grounding": []})
     deferred_retryable_failures: dict[str, dict[str, Any]] = {}
+    out_of_time_sources: set[str] = set()
     if envelope is not None:
         # The footer names the X provenance (render._render_stats).
         bundle.artifacts["x_provenance"] = envelope.provenance
@@ -2693,6 +2708,14 @@ def run(
                 # Skip GitHub keyword search if person-mode already ran
                 if source == "github" and (_github_person_done or _github_custom_done):
                     continue
+                if source == "jobs" and jobs_past_window:
+                    bundle.source_status["jobs"] = schema.SourceOutcome(
+                        source="jobs",
+                        state=schema.NO_RESULTS,
+                        attempted=False,
+                        detail=JOBS_PAST_WINDOW_SKIP,
+                    )
+                    continue
                 # Enforce per-source fetch cap. A CLI override (issue #716) raises
                 # the cap for capped sources so every X subquery in a multi-angle
                 # --plan fetches, instead of only the first two.
@@ -2837,6 +2860,7 @@ def run(
                     source == "youtube"
                     and not raw_items
                     and _retryable_youtube_outcome(outcome_note)
+                    and not artifact.get("_source_out_of_time")
                 ):
                     deferred_retryable_failures.setdefault(source, outcome_note)
                 else:
@@ -2846,6 +2870,10 @@ def run(
                         outcome_note["detail"],
                         attempted=outcome_note.get("attempted", True),
                     )
+                # A lane that already ran out of time would only run out
+                # again in the thin-results retry or the transcript backfill.
+                if artifact.pop("_source_out_of_time", False):
+                    out_of_time_sources.add(source)
             if isinstance(artifact, dict) and artifact.get("_source_outcome_detail"):
                 artifact = dict(artifact)
                 detail_rate_limited = _detail_rate_limits_source(source, artifact)
@@ -2904,6 +2932,11 @@ def run(
                             attempted=deferred_outcome.get("attempted", True),
                         )
             bundle.add_items(subquery.label, source, normalized)
+            if _is_jobs_board(source, artifact):
+                # The board's own counts and digest are read by name, and stay
+                # whatever happens to the board's items below.
+                bundle.artifacts["jobs"] = _jobs_board_artifact(artifact)
+                artifact = {key: value for key, value in artifact.items() if key != "digest"}
             if artifact:
                 bundle.artifacts.setdefault("grounding", []).append(artifact)
 
@@ -2932,6 +2965,8 @@ def run(
     _github_skip_retry = {"corpus"}
     if _github_person_done or _github_custom_done:
         _github_skip_retry.add("github")
+    if jobs_past_window:
+        _github_skip_retry.add("jobs")
     pre_retry_counts = {
         source: len(bundle.items_by_source.get(source, []))
         for source in deferred_retryable_failures
@@ -2957,6 +2992,7 @@ def run(
         first_party_handles=explicit_first_party,
         first_party_by_source=creator_first_party,
         run_started=run_started,
+        out_of_time_sources=out_of_time_sources,
     )
     for source, outcome in deferred_retryable_failures.items():
         if (
@@ -2990,11 +3026,6 @@ def run(
         bundle.artifacts["hiring_signals"] = hiring_summary
 
     _check_research(config)
-    items_by_source = _finalize_items_by_source(
-        bundle.items_by_source, topic=topic, config=config, depth=depth, mock=mock,
-        elapsed=time.monotonic() - run_started,
-    )
-    source_status = _finalize_source_status(bundle.source_status, items_by_source)
     # Normalized set of handles this run resolved for the topic. A candidate
     # authored by one of these is first-party and is exempted from the
     # entity-miss demotion in rerank (a post never repeats its own author's
@@ -3058,6 +3089,32 @@ def run(
             _log_prune_drop("x", len(x_stream), len(pruned), scope="merged stream")
             bundle.items_by_source["x"] = pruned
 
+    # Finalize after the deferred floor so the report's per-source view and the
+    # source_status counts describe the same post-floor evidence set fusion sees.
+    items_by_source = _finalize_items_by_source(
+        bundle.items_by_source, topic=topic, config=config, depth=depth, mock=mock,
+        elapsed=time.monotonic() - run_started, out_of_time=out_of_time_sources,
+    )
+    # Fusion gates on identity too, but the footer counts and Top voices read
+    # this per-source view, so a namesake left here still reaches the report.
+    # Gated after enrichment so a backfilled transcript can supply the anchor.
+    items_by_source = {
+        source: [
+            item for item in items
+            if entity_extract.matches_person_identity(item, plan.person_identity_anchors, x_handle)
+        ]
+        for source, items in items_by_source.items()
+    }
+    retained_markets = {
+        source_item_key(item) for item in items_by_source.get("polymarket", [])
+    }
+    for key, stream in bundle.items_by_source_and_query.items():
+        if key[1] == "polymarket":
+            bundle.items_by_source_and_query[key] = [
+                item for item in stream if source_item_key(item) in retained_markets
+            ]
+    source_status = _finalize_source_status(bundle.source_status, items_by_source)
+
     candidates = weighted_rrf(
         bundle.items_by_source_and_query,
         plan,
@@ -3065,6 +3122,7 @@ def run(
         range_from=from_date,
         range_to=to_date,
         first_party_handles=resolved_handles,
+        primary_handle=x_handle,
     )
     private_candidates = [
         candidate
@@ -3104,14 +3162,9 @@ def run(
     if hiring_summary:
         # The diagnostic source dump retains pruned jobs; hiring aggregation
         # needs their rejection identities after they leave the ranked pool.
-        retained_ids = {candidate.candidate_id for candidate in ranked_public}
-        hiring_summary["rejected_job_keys"] = sorted({
-            fusion.candidate_key(item)
-            for candidate in public_candidates
-            if candidate.candidate_id not in retained_ids
-            for item in candidate.source_items
-            if item.source == "jobs"
-        })
+        hiring_summary["rejected_job_keys"] = _rejected_job_keys(
+            public_candidates, ranked_public, bundle.artifacts.get("jobs"), topic,
+        )
     # Private corpus already cleared a body-aware retrieval floor; do not apply
     # the public title/snippet visibility gate (filenames often omit the head
     # token even when the document body matched).
@@ -3632,6 +3685,7 @@ def _finalize_items_by_source(
     depth: str = "default",
     mock: bool = False,
     elapsed: float = 0.0,
+    out_of_time: set[str] | None = None,
 ) -> dict[str, list[schema.SourceItem]]:
     finalized = {}
     for source, items in items_by_source_raw.items():
@@ -3648,7 +3702,8 @@ def _finalize_items_by_source(
             "topic": topic,
             "depth": depth,
         }
-        if source == "youtube" and items and not mock:
+        _key_youtube_fixture_by_entity_count(enrichment_request, source, config)
+        if source == "youtube" and items and not mock and source not in (out_of_time or ()):
             # Same budget-at-the-survivors principle as the digg branch
             # below: retrieval-time transcripts go to each search's
             # top-by-views candidates, while final selection ranks by
@@ -3665,6 +3720,7 @@ def _finalize_items_by_source(
                 )
                 youtube_yt.backfill_transcripts(
                     items, topic=topic, depth=depth, token=sc_token,
+                    entity_count=_comparison_entity_count(config),
                 )
                 http.fixture_source_record(enrichment_request, schema.to_dict(items))
         # Post-merge topic-relevance filter for Polymarket: comparison queries
@@ -3740,12 +3796,58 @@ def _merge_replayed_enrichment(
     return items
 
 
+def _is_jobs_board(source: str, artifact: Any) -> bool:
+    """Whether a jobs fetch read the company's board directly."""
+    return source == "jobs" and isinstance(artifact, dict) and artifact.get("tier") == "ats"
+
+
+def _jobs_board_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    """The board data a run keeps, with no digest when the caller asked for none."""
+    if env.jobs_digest_disabled():
+        return {key: value for key, value in artifact.items() if key != "digest"}
+    return artifact
+
+
+def _rejected_job_keys(
+    candidates: list[schema.Candidate],
+    ranked: list[schema.Candidate],
+    board: Any,
+    topic: str,
+) -> list[str]:
+    """The postings ranking dropped, which the hiring sections then leave out.
+
+    Ranking judges a posting against the topic's name. On the company's own
+    board that is a fair test of a stray posting when the topic is the
+    company, whose postings name it. When the topic is the person who leads
+    the company, no posting names the topic, so ranking drops every one it
+    looks at: that says nothing about the roles, and none is recorded.
+    """
+    if (
+        isinstance(board, dict)
+        and board.get("owned")
+        and not jobs._same_company(str(board.get("company") or ""), topic)
+    ):
+        return []
+    retained_ids = {candidate.candidate_id for candidate in ranked}
+    return sorted({
+        fusion.candidate_key(item)
+        for candidate in candidates
+        if candidate.candidate_id not in retained_ids
+        for item in candidate.source_items
+        if item.source == "jobs"
+    })
+
+
 def _apply_hiring_signal_gate(
     bundle: schema.RetrievalBundle,
     *,
     explicit: bool,
     topic: str,
 ) -> dict[str, Any] | None:
+    # On a standard run, a board whose titles cluster into no clear theme
+    # leaves the evidence pool, so scattered postings are not ranked and
+    # clustered beside what people said. The board's counts and digest live in
+    # ``bundle.artifacts["jobs"]`` and are not touched here.
     jobs_items = bundle.items_by_source.get("jobs") or []
     if not jobs_items:
         if explicit:
@@ -3777,6 +3879,53 @@ def _ensure_devto_in_plan(plan: schema.QueryPlan, available: list[str]) -> None:
     if "devto" not in plan.source_weights:
         plan.source_weights["devto"] = 1.0
         plan.source_weights = planner._normalize_weights(plan.source_weights)
+
+
+# Sources that are available only because the user installed their CLI or opted
+# in (INCLUDE_SOURCES, --search, a targeting flag). A host plan that names none
+# of them in any subquery almost always means the host planner never knew to
+# list them, not that it chose to skip them, so they ride the primary subquery.
+# Paid lanes with their own host decision step (amazon, meta_ads) stay out;
+# EXCLUDE_SOURCES and --search already filter ``available``.
+HOST_PLAN_BACKFILL_SOURCES = (
+    "digg",
+    "arxiv",
+    "techmeme",
+    "bluesky",
+    "truthsocial",
+    "stocktwits",
+    "linkedin",
+    "dripstack",
+    "devto",
+    "telegram",
+    "trustpilot",
+)
+
+
+def _ensure_unplanned_lanes_in_host_plan(
+    plan: schema.QueryPlan,
+    available: list[str],
+) -> None:
+    if not plan.subqueries:
+        return
+    planned = {source for subquery in plan.subqueries for source in subquery.sources}
+    missing = [
+        source for source in HOST_PLAN_BACKFILL_SOURCES
+        if source in available and source not in planned
+    ]
+    if not missing:
+        return
+    plan.subqueries[0].sources.extend(missing)
+    for source in missing:
+        plan.source_weights.setdefault(source, 1.0)
+    plan.source_weights = planner._normalize_weights(plan.source_weights)
+    log.source_log(
+        "Planner",
+        "Added installed/opted-in sources absent from every --plan subquery to "
+        f"{plan.subqueries[0].label}: {', '.join(missing)} "
+        "(set EXCLUDE_SOURCES to skip them).",
+        tty_only=False,
+    )
 
 
 def _external_plan_names_source(external_plan: Any, source: str) -> bool:
@@ -3851,47 +4000,7 @@ def _ensure_perplexity_in_plan(
     plan.source_weights = planner._normalize_weights(plan.source_weights)
 
 
-def _company_topic_likely(topic: str) -> bool:
-    text = topic.strip()
-    if not text:
-        return False
-    lower = text.lower()
-    if "?" in text or len(text.split()) > 4:
-        return False
-    generic = {
-        "how", "what", "why", "best", "top", "tutorial", "guide", "prompts",
-        "news", "latest", "ideas", "examples",
-    }
-    if any(word in generic for word in lower.split()):
-        return False
-    known_single_word_companies = {
-        "apple", "uber", "google", "microsoft", "amazon", "meta", "netflix",
-        "openai", "anthropic", "qualtrics", "stripe", "brex",
-    }
-    if " vs " in lower or " versus " in lower:
-        parts = re.split(r"\s+(?:vs|versus)\s+", text, maxsplit=1, flags=re.IGNORECASE)
-        if len(parts) != 2:
-            return False
-        return _comparison_side_company_like(parts[0], known_single_word_companies) or _comparison_side_company_like(
-            parts[1], known_single_word_companies
-        )
-    return bool(text[:1].isupper() or lower in known_single_word_companies)
-
-
-def _comparison_side_company_like(side: str, known_companies: set[str]) -> bool:
-    token = re.sub(r"[^\w.+#-]", "", side.strip().split()[0] if side.strip() else "")
-    if not token:
-        return False
-    lower = token.lower()
-    common_tech_terms = {
-        "python", "ruby", "javascript", "typescript", "java", "go", "golang",
-        "rust", "php", "swift", "kotlin", "scala", "clojure", "elixir",
-        "react", "vue", "angular", "svelte", "node", "django", "rails",
-        "postgres", "mysql", "redis", "kubernetes", "docker",
-    }
-    if lower in common_tech_terms:
-        return False
-    return bool(token[:1].isupper() or lower in known_companies)
+_company_topic_likely = company_resolve.company_topic_likely
 
 
 def _warnings(
@@ -4176,7 +4285,12 @@ def _finalize_source_status(
         elif state == health.OK and not count:
             state = outcome.lane_failure_state or schema.NO_RESULTS
         elif state == schema.PARTIAL and not count:
-            state = http.classify_failure(message=detail or "")
+            if source == "digg" and digg.is_stale_note(detail):
+                # A stale Digg copy that matched nothing is an empty answer
+                # with a coverage note, not a failed search.
+                state = schema.NO_RESULTS
+            else:
+                state = http.classify_failure(message=detail or "")
         finalized[source] = schema.SourceOutcome(
             source=source,
             state=state,
@@ -4247,9 +4361,30 @@ def _topic_first_party_candidates(topic: str) -> set[str]:
         tokens.add(mention.lower())
     for word in re.findall(r"[A-Za-z0-9_]{3,15}", topic or ""):
         lowered = word.lower()
-        if lowered not in relevance.STOPWORDS:
+        # Skip query scaffolding ("review", "news", "latest"): it describes the
+        # search, not the subject, and rerank._handle_is_topic skips it too.
+        if lowered not in relevance.STOPWORDS and lowered not in relevance.LOW_SIGNAL_QUERY_TOKENS:
             tokens.add(lowered)
     return tokens
+
+
+def _handle_contains_topic_word(handle: str, topic: str) -> bool:
+    """True when ``handle`` contains a whole topic word of three or more letters.
+
+    Covers short subject names that sit inside a longer handle ("vuejs" for
+    "Vue"), which rerank._handle_is_topic misses because it only counts
+    containment for words of four or more letters. The containment runs one
+    way only, so a short fragment of a longer topic word ("go" in "Google")
+    never matches, and query scaffolding words ("review", "news") are skipped.
+    """
+    for word in re.findall(r"[a-z0-9]+", (topic or "").lower()):
+        if len(word) < 3:
+            continue
+        if word in relevance.STOPWORDS or word in relevance.LOW_SIGNAL_QUERY_TOKENS:
+            continue
+        if word in handle:
+            return True
+    return False
 
 
 def _name_lane_subject(topic: str) -> str:
@@ -4323,6 +4458,7 @@ def _run_supplemental_searches(
     x_dicts = [
         {"author_handle": item.author or "", "text": item.body or ""}
         for item in bundle.items_by_source.get("x", [])
+        if entity_extract.matches_person_identity(item, plan.person_identity_anchors, x_handle)
     ]
     reddit_dicts = [
         {
@@ -4383,14 +4519,21 @@ def _run_supplemental_searches(
             for h in ([x_handle] + list(x_related or []))
             if h and h.strip()
         }
-        topic_tokens = {t for t in re.findall(r"[a-z0-9]+", topic.lower()) if len(t) > 2}
         seen = {h.lower() for h in resolved_handles_out}
         for h in [*handles, *related_handles]:
             clean = h.lstrip("@").strip().lower()
             if not clean or clean in seen:
                 continue
-            corroborated = clean in explicit or any(
-                token in clean or clean in token for token in topic_tokens
+            # "Looks like the topic's subject" is rerank's test: a handle that
+            # contains a topic word or is spelled from word prefixes. A bare
+            # substring match either way admitted fragments ("go" for "Google")
+            # and missed real subjects ("steipete" for "Peter Steinberger").
+            # Rerank's containment needs a 4+ letter word, so a short subject
+            # name inside a longer handle ("vuejs" for "Vue") is added here.
+            corroborated = (
+                clean in explicit
+                or rerank._handle_is_topic(clean, topic)
+                or _handle_contains_topic_word(clean, topic)
             )
             if corroborated:
                 resolved_handles_out.append(clean)
@@ -4816,8 +4959,12 @@ def _retry_thin_sources(
     first_party_handles: Iterable[str] | None = None,
     first_party_by_source: Mapping[str, Iterable[str]] | None = None,
     run_started: float | None = None,
+    out_of_time_sources: set[str] | None = None,
 ) -> None:
-    """Retry sources with thin results using simplified core subject query."""
+    """Retry sources with thin results using simplified core subject query.
+
+    Sources whose retry ran out of time are added to ``out_of_time_sources``.
+    """
     if depth == "quick":
         return
     # No new paid/network work after the enrichment budget expired.
@@ -4864,7 +5011,9 @@ def _retry_thin_sources(
 
     def _retry_one_source(
         source: str,
-    ) -> tuple[str, list[schema.SourceItem], dict[str, Any] | None]:
+    ) -> tuple[
+        str, list[schema.SourceItem], dict[str, Any] | None, tuple, bool, dict[str, Any] | None,
+    ]:
         raw_items, artifact = _retrieve_stream(
             topic=topic,
             subquery=retry_subquery,
@@ -4892,6 +5041,7 @@ def _retry_thin_sources(
         outcome_note = artifact.get("_source_outcome") if isinstance(artifact, dict) else None
         detail_note = artifact.get("_source_outcome_detail") if isinstance(artifact, dict) else None
         detail_state = artifact.get("_source_outcome_detail_state") if isinstance(artifact, dict) else None
+        out_of_time = isinstance(artifact, dict) and bool(artifact.get("_source_out_of_time"))
         normalized = _normalize_score_dedupe(
             source,
             raw_items,
@@ -4909,7 +5059,10 @@ def _retry_thin_sources(
             defer_relevance_prune=(source == "x"),
         )
         if source == "jobs":
-            return source, normalized, outcome_note, (detail_note, detail_state)
+            return (
+                source, normalized, outcome_note, (detail_note, detail_state), out_of_time,
+                artifact if _is_jobs_board(source, artifact) else None,
+            )
         normalized = _apply_reddit_stream_keepers(
             source, normalized, settings["per_stream_limit"], topic
         )
@@ -4917,7 +5070,7 @@ def _retry_thin_sources(
             outcome_note = outcome_note or artifact["_source_outcome_deferred"]
         if not normalized and isinstance(artifact, dict):
             outcome_note = outcome_note or artifact.get("_source_outcome_if_empty")
-        return source, normalized, outcome_note, (detail_note, detail_state)
+        return source, normalized, outcome_note, (detail_note, detail_state), out_of_time, None
 
     retryable = [s for s in thin_sources if s not in rate_limited_sources]
 
@@ -4933,7 +5086,10 @@ def _retry_thin_sources(
         for future in done:
             source = futures[future]
             try:
-                source, normalized, outcome_note, (detail_note, detail_state) = future.result(timeout=0)
+                (
+                    source, normalized, outcome_note, (detail_note, detail_state), out_of_time,
+                    jobs_board,
+                ) = future.result(timeout=0)
             except Exception as exc:
                 print(f"[Pipeline] Retry failed for {source}: {type(exc).__name__}: {exc}", file=sys.stderr)
                 state, attempted = _classify_source_failure(exc)
@@ -4944,6 +5100,8 @@ def _retry_thin_sources(
                     attempted=attempted,
                 )
                 continue
+            if out_of_time and out_of_time_sources is not None:
+                out_of_time_sources.add(source)
             try:
                 if outcome_note:
                     bundle.record_failure(
@@ -4960,6 +5118,10 @@ def _retry_thin_sources(
                 if new_items:
                     primary_label = plan.subqueries[0].label if plan.subqueries else "primary"
                     bundle.add_items(primary_label, source, new_items)
+                # A board read only on this retry still gives the footer its
+                # counts and the report its digest.
+                if jobs_board and "jobs" not in bundle.artifacts:
+                    bundle.artifacts["jobs"] = _jobs_board_artifact(jobs_board)
             except Exception as exc:
                 print(f"[Pipeline] Retry failed for {source}: {type(exc).__name__}: {exc}", file=sys.stderr)
                 state, attempted = _classify_source_failure(exc)
@@ -5124,6 +5286,7 @@ def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
         "date_range": list(kwargs.get("date_range") or ()),
         "depth": kwargs.get("depth") or "",
     }
+    _key_youtube_fixture_by_entity_count(fixture_request, source, kwargs.get("config"))
     module_backed = source in {
         "reddit",
         "x",
@@ -5410,7 +5573,55 @@ def _fetch_youtube_stream(
     freshness_mode: str | None = None,
 ) -> tuple[list[dict], dict]:
     """Search, backfill, transcribe, and comment-enrich one YouTube query."""
+    # An abandoned lane keeps running after the report is saved; once the
+    # run is over, every ScrapeCreators call in it is wasted credit (#1315).
+    deadline = config.get("_research_deadline")
+    with youtube_yt.sc_spend_until(
+        lambda: _research_stopped(config),
+        cancel=config.get("_enrich_cancel"),
+        deadline=deadline,
+        return_deadline=(
+            deadline - youtube_yt._LANE_RETURN_MARGIN_SECONDS
+            if deadline is not None else None
+        ),
+    ):
+        return _fetch_youtube_stream_live(
+            yt_query, from_date, to_date, depth, config,
+            has_ytdlp=has_ytdlp, freshness_mode=freshness_mode,
+        )
+
+
+def _comparison_entity_count(config: dict[str, Any] | None) -> int:
+    return int((config or {}).get("_comparison_entity_count") or 1)
+
+
+def _key_youtube_fixture_by_entity_count(
+    request: dict[str, Any], source: str, config: dict[str, Any] | None,
+) -> None:
+    # Only comparison runs carry the count, so fixtures already recorded for
+    # single-topic runs keep their original keys.
+    entity_count = _comparison_entity_count(config)
+    if source == "youtube" and entity_count > 1:
+        request["comparison_entity_count"] = entity_count
+
+
+def _interpreter_shutting_down(exc: BaseException) -> bool:
+    """An abandoned lane outliving main() can no longer start thread pools."""
+    return isinstance(exc, RuntimeError) and "interpreter shutdown" in str(exc)
+
+
+def _fetch_youtube_stream_live(
+    yt_query: str,
+    from_date: str,
+    to_date: str,
+    depth: str,
+    config: dict[str, Any],
+    *,
+    has_ytdlp: bool,
+    freshness_mode: str | None,
+) -> tuple[list[dict], dict]:
     result = None
+    run_over = False
     youtube_failure: str | None = None
     recovered_failure: str | None = None
     # ScrapeCreators key (when present) is the default-on backup tier: it
@@ -5420,25 +5631,32 @@ def _fetch_youtube_stream(
         config.get("SCRAPECREATORS_API_KEY", "")
         if env.is_youtube_sc_available(config) else None
     )
+    entity_count = _comparison_entity_count(config)
     # Try yt-dlp first; the SC transcript fallback covers per-video failures.
     if has_ytdlp:
         try:
             result = youtube_yt.search_and_transcribe(
                 yt_query, from_date, to_date, depth=depth, token=sc_token,
-                freshness_mode=freshness_mode,
+                freshness_mode=freshness_mode, entity_count=entity_count,
             )
             if result.get("error"):
                 youtube_failure = str(result["error"])
         except Exception as exc:
             youtube_failure = str(exc)
             result = None
+            # Not an empty yt-dlp result: the process is exiting.
+            run_over = _interpreter_shutting_down(exc)
+    out_of_time = (result or {}).get("out_of_time")
+    if not out_of_time and youtube_yt._lane_out_of_time():
+        out_of_time = "lane deadline passed"
+    run_over = run_over or bool(out_of_time) or _research_stopped(config)
     free_items = list((result or {}).get("items") or [])
     min_items = env.youtube_sc_min_items(config)
     backfill_thin = bool(free_items) and len(free_items) < min_items
     thin_detail: str | None = None
     thin_error = False
     thin_retryable = False
-    if (not free_items or backfill_thin) and sc_token:
+    if (not free_items or backfill_thin) and sc_token and not run_over:
         backfill_scope = (
             http.capture_failures() if free_items else contextlib.nullcontext([])
         )
@@ -5452,7 +5670,7 @@ def _fetch_youtube_stream(
                 sc_result = youtube_yt.search_youtube_sc(
                     yt_query, from_date, to_date, depth=depth, token=sc_token,
                     skip_transcript_ids=transcribed_free_ids,
-                    freshness_mode=freshness_mode,
+                    freshness_mode=freshness_mode, entity_count=entity_count,
                 )
             sc_error = str(sc_result["error"]) if sc_result.get("error") else None
             if backfill_thin:
@@ -5510,10 +5728,22 @@ def _fetch_youtube_stream(
         result = {"items": []}
     # Enrich top videos with comments (default-on when a key is present).
     items = youtube_yt.parse_youtube_response(result)
-    if items and env.is_youtube_comments_available(config):
+    if not out_of_time and youtube_yt._lane_out_of_time():
+        out_of_time = "lane deadline passed"
+    if items and env.is_youtube_comments_available(config) and not out_of_time:
         youtube_yt.enrich_with_comments(
-            items, token=config.get("SCRAPECREATORS_API_KEY", ""),
+            items, token=sc_token or "", entity_count=entity_count,
         )
+    if not out_of_time and youtube_yt._lane_out_of_time():
+        out_of_time = "lane deadline passed"
+    if out_of_time:
+        detail = f"youtube timed out: {out_of_time}"
+        if thin_detail or youtube_failure:
+            detail += f"; {thin_detail or youtube_failure}"
+        return items, {
+            **_outcome_artifact(health.TIMEOUT, detail),
+            "_source_out_of_time": True,
+        }
     if thin_detail:
         if not thin_error:
             return items, {"_source_outcome_detail": thin_detail}
@@ -5579,14 +5809,37 @@ def _retrieve_stream_impl(
         return grounding.web_search(
             subquery.search_query, date_range, config, backend=web_backend)
     if source == "jobs":
-        return jobs.search_jobs(
-            raw_topic or topic or subquery.search_query,
-            date_range,
-            config,
-            depth=depth,
+        # The company the topic resolved to, so a person's name searches the
+        # board of the company they lead, starting from its official site.
+        company = config.get("_company") or {}
+
+        def search(name: str, **where: Any) -> tuple[list[dict], dict]:
+            return jobs.search_jobs(
+                name,
+                date_range,
+                config,
+                depth=depth,
+                explicit=bool(config.get("_hiring_signals_mode")),
+                entity_count=_comparison_entity_count(config),
+                **where,
+            )
+
+        items, artifact = search(
+            company.get("company") or raw_topic or topic or subquery.search_query,
             web_backend=web_backend,
-            explicit=bool(config.get("_hiring_signals_mode")),
+            site=str(company.get("company_site") or ""),
         )
+        # The lookup named no company, and the topic has no board of its own:
+        # a person, searched by name. The company the host named with
+        # ``--ticker`` is searched then, and used only when it has a board.
+        # It comes with no official site, so the board gives a digest only
+        # when it names that company itself.
+        host_company = str(company.get("host_company") or "")
+        if host_company and not company.get("company") and not _is_jobs_board("jobs", artifact):
+            host_items, host_artifact = search(host_company, web_backend="none")
+            if _is_jobs_board("jobs", host_artifact):
+                return host_items, host_artifact
+        return items, artifact
     if source == "reddit":
         # Use raw_topic so expand_reddit_queries() generates diverse variants
         # from the original user topic, not the planner's narrowed search_query.
@@ -5995,6 +6248,7 @@ def _retrieve_stream_impl(
                 env.is_youtube_sc_available(config),
                 env.youtube_sc_min_items(config),
                 env.is_youtube_comments_available(config),
+                _comparison_entity_count(config),
             ),
             lambda: _fetch_youtube_stream(
                 yt_query, from_date, to_date, depth, config, has_ytdlp=has_ytdlp,
@@ -6009,6 +6263,9 @@ def _retrieve_stream_impl(
         tiktok_query = raw_topic or subquery.search_query
 
         def _fetch_tiktok() -> tuple[list[dict], dict]:
+            # Leave time to publish collected videos before the outer stream wait expires.
+            deadline = _research_deadline(config, STREAM_FUTURE_TIMEOUT_SECONDS) - 1.0
+            cancel = config.get("_enrich_cancel")
             result = tiktok.search_and_enrich(
                 tiktok_query,
                 from_date,
@@ -6018,15 +6275,21 @@ def _retrieve_stream_impl(
                 hashtags=tiktok_hashtags,
                 creators=tiktok_creators,
                 config=config,
+                deadline=deadline,
+                cancel=cancel,
             )
             items = tiktok.parse_tiktok_response(result)
             if (
                 items
                 and env.is_tiktok_comments_available(config)
                 and not items[0].get("_oss_backend")
+                and result.get("error") != tiktok.BUDGET_ERROR
             ):
                 sc_token = config.get("SCRAPECREATORS_API_KEY", "")
-                tiktok.enrich_with_comments(items, token=sc_token)
+                try:
+                    tiktok.enrich_with_comments(items, token=sc_token, deadline=deadline, cancel=cancel)
+                except http.DeadlineExceeded:
+                    result["error"] = tiktok.BUDGET_ERROR
             return items, _result_outcome_artifact(source, result)
 
         return fetch_memo.fetch_once(
@@ -6044,6 +6307,11 @@ def _retrieve_stream_impl(
         # Use raw_topic so expand_instagram_queries() generates diverse variants
         # from the original user topic, not the planner's narrowed search_query.
         ig_query = raw_topic or subquery.search_query
+        ig_deadline = _research_deadline(config, STREAM_FUTURE_TIMEOUT_SECONDS)
+        # Leave time to publish collected reels before the outer stream wait expires.
+        remaining = max(0, ig_deadline - time.monotonic())
+        ig_deadline -= min(1.0, remaining / 10)
+        ig_cancel = config.get("_enrich_cancel")
 
         def _fetch_instagram() -> tuple[list[dict], dict]:
             result = instagram.search_and_enrich(
@@ -6054,6 +6322,8 @@ def _retrieve_stream_impl(
                 token=env.get_instagram_token(config),
                 ig_creators=ig_creators,
                 config=config,
+                deadline=ig_deadline,
+                cancel=ig_cancel,
             )
             items = instagram.parse_instagram_response(result)
             if (
@@ -6063,6 +6333,11 @@ def _retrieve_stream_impl(
             ):
                 instagram.enrich_with_comments(
                     items, token=config.get("SCRAPECREATORS_API_KEY", ""),
+                    deadline=ig_deadline, cancel=ig_cancel,
+                )
+            if (ig_cancel is not None and ig_cancel.is_set()) or time.monotonic() >= ig_deadline:
+                return items, _outcome_artifact(
+                    health.PARTIAL if items else health.TIMEOUT, instagram.RESEARCH_TIMEOUT,
                 )
             return items, _result_outcome_artifact(source, result)
 
@@ -6143,6 +6418,9 @@ def _retrieve_stream_impl(
         # Enrichment with attached X posts is deferred to
         # _finalize_items_by_source so it runs on the items that actually
         # survive dedupe rather than on top-K of the raw fanout.
+        stale = digg.stale_note(result)
+        if stale:
+            return items, _outcome_artifact(health.PARTIAL, stale)
         return items, _result_outcome_artifact(source, result)
     if source == "arxiv":
         result = arxiv.search_arxiv(subquery.search_query, from_date, to_date, depth=depth)
@@ -6315,7 +6593,10 @@ def _retrieve_stream_impl(
         # lookup and gh-CLI subprocess fallback (up to 5s timeout each).
         token = github.resolve_token(config.get("GITHUB_TOKEN"))
         response = github.search_github(subquery.search_query, from_date, to_date, depth=depth, token=token)
-        items = github.parse_github_response(response)
+        # Judge results against the stable research topic, not the narrowed
+        # per-subquery search_query, as polymarket does above.
+        relevance_topic = raw_topic or topic or subquery.search_query
+        items = github.parse_github_response(response, topic=relevance_topic)
         # Note: an unauth rate-limit (response["error"]) is expected on the
         # tokenless anon tier and returns empty here rather than raising — github
         # is now always eligible, so raising would spam "github failed" on every

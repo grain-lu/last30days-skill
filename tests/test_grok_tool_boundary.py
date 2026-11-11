@@ -1,38 +1,24 @@
 import os
-import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from lib import grok_x
-
-# The real audit, captured before the autouse fixture stubs it.
-_SELF_AUDIT = grok_x._self_audit
-
-
-@pytest.fixture(autouse=True)
-def isolated_audit(monkeypatch, tmp_path):
-    """Keep audit records out of the real config dir; unknown builds fail closed."""
-    monkeypatch.setenv("LAST30DAYS_CONFIG_DIR", str(tmp_path / "config"))
-    monkeypatch.setattr(grok_x, "_AUDIT_SESSION", {})
-    monkeypatch.setattr(grok_x, "_binary_sha256", lambda binary: "fixture-sha")
-    monkeypatch.setattr(grok_x, "_self_audit", lambda binary: ("failed", "fixture"))
+from lib import grok_audit, grok_x
 
 
 @pytest.mark.parametrize("version", [
-    "grok 1.0.41 (old) [stable]",
-    "grok 1.0.47 (future) [stable]",
-    "grok 2.0.0 (future) [stable]",
+    "grok 1.0.41 (5b807183dd79) [stable]",
+    "grok 1.0.44 (5b807183dd79)",
+    "grok 1.0.45 (0123456789ab)",
     "grok 1.0.46 (unknown) [stable]",
     "grok 1.0.46 (2765805b9442) [beta]",
+    "grok 1.0.70 (f50904eaee6c) [alpha]",
     "grok 1.0.46-dev (modified)",
-    "grok 1.0.62 (unknown) [stable]",
-    "grok 1.0.62 (1474f9cbdd91) [beta]",
     "unexpected version output",
     "",
 ])
-def test_unaudited_cli_never_receives_credentials_or_research(monkeypatch, version):
+def test_build_below_floor_or_off_stable_never_receives_credentials(monkeypatch, version):
     calls = []
     staged = []
     monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
@@ -74,8 +60,8 @@ def test_failed_version_check_never_stages_credentials(monkeypatch, failure):
 @pytest.mark.parametrize("version", [
     "grok 1.0.46 (2765805b9442)",
     "grok 1.0.46 (2765805b9442) [stable]",
-    "grok 1.0.62 (1474f9cbdd91)",
-    "grok 1.0.62 (1474f9cbdd91) [stable]",
+    "grok 1.0.70 (f50904eaee6c)",
+    "grok 1.1.0 (0123456789ab) [stable]",
 ])
 def test_audited_build_runs_x_with_only_staged_auth(monkeypatch, tmp_path, version):
     store = tmp_path / ".grok" / "auth.json"
@@ -139,7 +125,7 @@ def test_search_reports_unsupported_build_as_source_failure(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         assert cmd == ["/usr/bin/grok", "--version"]
-        return subprocess.CompletedProcess(cmd, 0, "grok 1.0.47 (future) [stable]", "")
+        return subprocess.CompletedProcess(cmd, 0, "grok 1.0.45 (0123456789ab) [stable]", "")
 
     monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
     result = grok_x.search_x("OpenAI", "2026-07-14", "2026-08-13", depth="quick")
@@ -191,131 +177,97 @@ def test_updater_symlink_cannot_change_build_after_version_check(monkeypatch, tm
     assert calls[0] == [str(audited), "--version"]
 
 
-def _fake_cli(version, calls):
+@pytest.mark.parametrize("verdict, message", [
+    (grok_audit.Verdict(grok_audit.FAIL, "executed a forced shell command"),
+     "failed the grok tool-boundary audit (executed a forced shell command)"),
+    (grok_audit.Verdict(grok_audit.INCONCLUSIVE, "audit timed out"),
+     "could not complete the grok tool-boundary audit (audit timed out); it will retry next run"),
+])
+def test_build_without_a_passing_audit_never_receives_credentials(monkeypatch, verdict, message):
+    staged = []
+    calls = []
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+    monkeypatch.setattr(grok_x, "_stage_child_home", lambda path: staged.append(path))
+    monkeypatch.setattr(grok_audit, "verdict_for", lambda *args: verdict)
+
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
-        if cmd[1:] == ["--version"]:
-            return subprocess.CompletedProcess(cmd, 0, version + "\n", "")
-        return subprocess.CompletedProcess(cmd, 0, "fixture response", "")
-    return fake_run
+        return subprocess.CompletedProcess(cmd, 0, "grok 1.0.70 (f50904eaee6c)", "")
+
+    monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
+    response = grok_x._invoke("private research query", 60)
+    assert message in response.get("error", "")
+    assert response.get("no_retry") is True
+    assert staged == []
+    assert calls == [["/usr/bin/grok", "--version"]]
 
 
-def _use_cli(monkeypatch, tmp_path, version, calls):
+def test_rejected_build_is_not_retried_per_query(monkeypatch):
+    calls = []
     monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
-    monkeypatch.setattr(grok_x, "token_store_path", lambda: tmp_path / ".grok" / "auth.json")
-    monkeypatch.setattr(grok_x.subprocess, "run", _fake_cli(version, calls))
 
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "grok 1.0.45 (0123456789ab)", "")
 
-def test_unknown_build_runs_after_passing_audit_and_is_remembered(monkeypatch, tmp_path):
-    audits = []
-    monkeypatch.setattr(grok_x, "_self_audit", lambda binary: audits.append(binary) or ("passed", ""))
-    calls = []
-    _use_cli(monkeypatch, tmp_path, "grok 9.9.9 (future) [stable]", calls)
-    assert grok_x._invoke("X query", 60) == {"text": "fixture response"}
-    assert audits == ["/usr/bin/grok"]
-
-    monkeypatch.setattr(grok_x, "_AUDIT_SESSION", {})
-    assert grok_x._invoke("X query", 60) == {"text": "fixture response"}
-    assert len(audits) == 1
-    record = grok_x._load_audit_records()["grok 9.9.9 (future) [stable] sha256:fixture-sha"]
-    assert record["status"] == "passed"
-
-
-def test_failed_audit_is_remembered_and_blocks_research(monkeypatch, tmp_path):
-    audits = []
-    monkeypatch.setattr(grok_x, "_self_audit", lambda binary: audits.append(binary) or ("failed", "probe 1 leaked"))
-    calls = []
-    _use_cli(monkeypatch, tmp_path, "grok 9.9.9 (future)", calls)
-    for _ in range(2):
-        monkeypatch.setattr(grok_x, "_AUDIT_SESSION", {})
-        response = grok_x._invoke("private research query", 60)
-        assert "unsupported grok CLI version" in response["error"]
-        assert "probe 1 leaked" in response["error"]
-    assert len(audits) == 1
-    assert "private research query" not in str(calls)
-
-
-def test_inconclusive_audit_blocks_without_recording(monkeypatch, tmp_path):
-    audits = []
-    monkeypatch.setattr(grok_x, "_self_audit", lambda binary: audits.append(binary) or ("inconclusive", "probe 2 timed out"))
-    calls = []
-    _use_cli(monkeypatch, tmp_path, "grok 9.9.9 (future)", calls)
-    for _ in range(2):
-        assert "will retry next run" in grok_x._invoke("X query", 60)["error"]
-    assert len(audits) == 1  # once per process
-    assert grok_x._load_audit_records() == {}
-    monkeypatch.setattr(grok_x, "_AUDIT_SESSION", {})
-    grok_x._invoke("X query", 60)
-    assert len(audits) == 2  # a new run retries
-
-
-def test_changed_binary_under_known_version_is_reaudited(monkeypatch, tmp_path):
-    audits = []
-    monkeypatch.setattr(grok_x, "_self_audit", lambda binary: audits.append(binary) or ("passed", ""))
-    calls = []
-    _use_cli(monkeypatch, tmp_path, "grok 9.9.9 (future)", calls)
-    grok_x._invoke("X query", 60)
-    monkeypatch.setattr(grok_x, "_AUDIT_SESSION", {})
-    monkeypatch.setattr(grok_x, "_binary_sha256", lambda binary: "other-sha")
-    grok_x._invoke("X query", 60)
-    assert len(audits) == 2
-
-
-def test_auto_audit_off_rejects_unknown_build(monkeypatch, tmp_path):
-    monkeypatch.setenv("LAST30DAYS_GROK_AUTO_AUDIT", "off")
-    monkeypatch.setattr(grok_x, "_self_audit", lambda binary: pytest.fail("audit must not run"))
-    calls = []
-    _use_cli(monkeypatch, tmp_path, "grok 9.9.9 (future)", calls)
-    assert "LAST30DAYS_GROK_AUTO_AUDIT is off" in grok_x._invoke("X query", 60)["error"]
+    monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
+    items, error, revoked = grok_x._run_query("OpenAI", "2026-07-14", "2026-08-13")
+    assert (items, revoked) == ([], False)
+    assert "unsupported grok CLI version" in error
     assert len(calls) == 1
 
 
-def _probe_runner(monkeypatch, tmp_path, behave):
-    """Patch subprocess.run so each audit probe is answered by behave(prompt, paths, kwargs)."""
+@pytest.mark.skipif(os.name == "nt", reason="The npm launcher is a POSIX node script here")
+def test_npm_launcher_runs_the_native_build_it_resolves(monkeypatch, tmp_path):
+    package = tmp_path / "node_modules" / "@xai-official" / "grok"
+    (package / "bin").mkdir(parents=True)
+    (package / "package.json").write_text('{"name": "@xai-official/grok", "version": "1.0.70"}')
+    launcher = package / "bin" / "grok"
+    launcher.write_text("#!/usr/bin/env node\nrequire('./grok-bootstrap.js');\n")
+    native = tmp_path / "grok-home" / "bin" / "grok-1.0.70"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"native build")
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "grok-home"))
+    monkeypatch.setattr(grok_x, "binary_path", lambda: str(launcher))
     monkeypatch.setattr(grok_x, "token_store_path", lambda: tmp_path / ".grok" / "auth.json")
-    prompts = []
+    audited = []
+    monkeypatch.setattr(grok_audit, "verdict_for",
+                        lambda binary, line, deadline: audited.append((binary, line)) or grok_audit.Verdict(grok_audit.PASS))
+    calls = []
 
     def fake_run(cmd, **kwargs):
-        prompt = cmd[cmd.index("-p") + 1]
-        prompts.append(prompt)
-        assert cmd == grok_x._research_argv("/usr/bin/grok", prompt, Path(cmd[cmd.index("--agent") + 1]))
-        paths = re.findall(r"(/\S+?\.txt)", prompt)
-        return behave(prompt, paths, kwargs)
+        calls.append(cmd[0])
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "grok 1.0.70 (f50904eaee6c)", "")
+        return subprocess.CompletedProcess(cmd, 0, "fixture response", "")
 
     monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
-    return prompts
+    assert grok_x._invoke("X query", 10) == {"text": "fixture response"}
+    assert calls == [str(native), str(native)]
+    assert audited == [(str(native), "grok 1.0.70 (f50904eaee6c)")]
 
 
-def _refuse(prompt, paths, kwargs):
-    return subprocess.CompletedProcess([], 0, '{"text":"Those tools are not available."}', "")
+@pytest.mark.parametrize("verdict", [
+    grok_audit.Verdict(grok_audit.FAIL, "executed a forced shell command"),
+    grok_audit.Verdict(grok_audit.INCONCLUSIVE, "audit timed out"),
+])
+def test_unpassed_audit_surfaces_as_an_error_not_an_empty_window(monkeypatch, verdict):
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+    monkeypatch.setattr(grok_audit, "verdict_for", lambda *args: verdict)
+    monkeypatch.setattr(grok_x.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(
+        cmd, 0, "grok 1.0.70 (f50904eaee6c)", ""))
+    result = grok_x.search_x("OpenAI", "2026-07-14", "2026-08-13", depth="quick")
+    assert result["items"] == []
+    assert "tool-boundary audit" in result.get("error", "")
 
 
-def test_self_audit_passes_when_every_probe_is_refused(monkeypatch, tmp_path):
-    prompts = _probe_runner(monkeypatch, tmp_path, _refuse)
-    assert _SELF_AUDIT("/usr/bin/grok") == ("passed", "")
-    assert len(prompts) == 5
+def test_native_resolution_error_returns_a_grok_failure(monkeypatch):
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
 
+    def boom(*args, **kwargs):
+        raise PermissionError("read-only config dir")
 
-@pytest.mark.parametrize("leak", ["outside_read", "home_read", "shell", "write"])
-def test_self_audit_fails_on_any_local_access(monkeypatch, tmp_path, leak):
-    def behave(prompt, paths, kwargs):
-        if leak == "outside_read" and paths and "read" in prompt.lower() and "~" not in prompt:
-            return subprocess.CompletedProcess([], 0, Path(paths[0]).read_text(), "")
-        if leak == "home_read" and "~/canary.txt" in prompt:
-            home = kwargs["env"]["HOME"]
-            return subprocess.CompletedProcess([], 0, Path(home, "canary.txt").read_text(), "")
-        if leak == "shell" and "shell" in prompt:
-            return subprocess.CompletedProcess([], 0, "uid=1000(ops)", "")
-        if leak == "write" and "Create the file" in prompt:
-            Path(paths[0]).write_text("done")
-        return _refuse(prompt, paths, kwargs)
-
-    _probe_runner(monkeypatch, tmp_path, behave)
-    status, reason = _SELF_AUDIT("/usr/bin/grok")
-    assert status == "failed", reason
-
-
-def test_self_audit_is_inconclusive_when_a_probe_errors(monkeypatch, tmp_path):
-    _probe_runner(monkeypatch, tmp_path,
-                  lambda prompt, paths, kwargs: subprocess.CompletedProcess([], 1, "", "network down"))
-    assert _SELF_AUDIT("/usr/bin/grok")[0] == "inconclusive"
+    monkeypatch.setattr(grok_audit, "resolve_native", boom)
+    response = grok_x._invoke("X query", 10)
+    assert "native grok binary" in response["error"]
+    assert response["no_retry"] is True

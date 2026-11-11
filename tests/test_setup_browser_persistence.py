@@ -18,7 +18,9 @@ def run_setup(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(env, "CONFIG_FILE", config_path)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
-    installed = {"yt-dlp", "digg-pp-cli", "arxiv-pp-cli", "techmeme-pp-cli"}
+    installed = {
+        "yt-dlp", "digg-pp-cli", "arxiv-pp-cli", "techmeme-pp-cli", "yahoo-finance-pp-cli",
+    }
     monkeypatch.setattr(
         shutil, "which", lambda name: f"/test/bin/{name}" if name in installed else None
     )
@@ -66,7 +68,7 @@ def run_setup(tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize(
     "browser",
-    ["chrome", "brave", "edge", "vivaldi", "opera", "arc", "chromium", "firefox", "safari"],
+    ["chrome", "brave", "edge", "vivaldi", "opera", "arc", "dia", "chromium", "firefox", "safari"],
 )
 def test_consented_browser_remains_usable_after_setup(run_setup, browser):
     saved, config, _ = run_setup({".x.com": browser})

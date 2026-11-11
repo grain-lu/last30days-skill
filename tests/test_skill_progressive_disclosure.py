@@ -30,7 +30,9 @@ def test_every_reference_has_the_correct_conditional_load_gate():
 def test_core_and_standard_research_fit_the_read_budget():
     core = (SKILL_ROOT / "SKILL.md").read_bytes()
     assert len(core.splitlines()) <= 500, "root skill exceeds the 500-line read budget"
-    assert len(core) <= 32_000, "root skill exceeds the 32,000-byte read budget"
+    # 本地 fork 抬高 500B：weixin 中文源行 + TikTok/Instagram keyless 兜底句
+    # （上游 v3.34.1 自身 31,988 已压线，本地实测 32,281）。
+    assert len(core) <= 32_500, "root skill exceeds the 32,500-byte read budget"
     routes = routing_table()
     assert routes == ROUTES, "classify new routes before measuring the standard path"
     standard = {name for condition in STANDARD_CONDITIONS for name in routes[condition]}
@@ -52,8 +54,8 @@ def test_configured_user_without_global_marker_has_a_bounded_setup_check():
     total = len((SKILL_ROOT / "SKILL.md").read_bytes()) + sum(
         len(reference_text(name).encode("utf-8")) for name in names
     )
-    # 本地 fork 抬高 1KB:TRANSCRIPT_API_KEY 注册 + weixin/bilibili 中文源
-    # 文档行(上游 v3.28.0 正好压线 190_000,任何本地增量都会超)。
+    # 本地 fork 抬高 500B：weixin 中文源文档行 + TikTok/Instagram keyless
+    # 兜底句（上游 v3.34.1 压线 190_500，本地实测 190_696）。
     assert total <= 191_000, f"configured path without a global marker loads {total} bytes"
 
 

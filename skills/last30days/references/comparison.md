@@ -57,12 +57,8 @@ MAIN_TARGETING=()
 [ -n "$TOPIC_A_SUBS" ] && MAIN_TARGETING+=(--subreddits="$TOPIC_A_SUBS")
 
 # BSD/macOS mktemp requires XXXXXX at the end of the template.
-QUERY_PLAN_FILE=$(mktemp "${TMPDIR:-/tmp}/last30days-plan.XXXXXX")
 COMPETITORS_PLAN_FILE=$(mktemp "${TMPDIR:-/tmp}/last30days-competitors.XXXXXX")
-trap 'rm -f "$QUERY_PLAN_FILE" "$COMPETITORS_PLAN_FILE"' EXIT
-cat >| "$QUERY_PLAN_FILE" <<'QUERY_PLAN_EOF'
-{QUERY_PLAN_JSON}
-QUERY_PLAN_EOF
+trap 'rm -f -- "$COMPETITORS_PLAN_FILE"' EXIT
 # >| not >: mktemp already created the file, so a plain > is refused under
 # `set -o noclobber` (leaving the plan empty -> deterministic fallback).
 cat >| "$COMPETITORS_PLAN_FILE" <<'PLAN_EOF'
@@ -72,15 +68,19 @@ PLAN_EOF
 
 "${LAST30DAYS_PYTHON}" "${SKILL_DIR}/scripts/last30days.py" "$COMPARISON_TOPIC" \
   --emit=compact \
-  --plan "$QUERY_PLAN_FILE" \
+  --plan - \
   --save-dir="${LAST30DAYS_MEMORY_DIR}" \
   --save-suffix=v3 \
   "${MAIN_TARGETING[@]}" \
-  --competitors-plan "$COMPETITORS_PLAN_FILE"
+  --competitors-plan "$COMPETITORS_PLAN_FILE" <<'QUERY_PLAN_EOF'
+{QUERY_PLAN_JSON}
+QUERY_PLAN_EOF
 )
 ```
 
 For any additional outer targeting flag, capture its value through a quoted heredoc and add it to `MAIN_TARGETING` with a quoted variable expansion. Omit unresolved flags. Never paste a topic, handle, subreddit, or fetched context directly into shell command words. The quoted heredocs keep shell-active text literal; `json.tool` rejects malformed peer JSON before the research run.
+
+The cleanup trap removes the competitors plan file after research. For a later HTML export, follow `save-html-brief.md` with `--cached-report` and the original topic. Do not replay the removed plan path. The cache preserves every entity's report and targeting; if the cache expires, recreate the plans before running research again.
 
 ### Without host web search
 
@@ -129,7 +129,7 @@ Topic A (the main topic, first in the vs-string) uses outer `--x-handle`, `--x-r
 
 **When host web search is available, do WebSearch supplements** (through the post-engine isolated web search dispatch in the research runbook) for: `{TOPIC_A} vs {TOPIC_B} comparison {YEAR}` and `{TOPIC_A} vs {TOPIC_B} which is better` — these catch rivalry articles that per-entity passes might not surface.
 
-**Use `RESOLVED_POSITIONING` per entity (Step 0.55 item 6) in two ways.** First, ground each entity's `What it is` cell in its CURRENT fetched pitch - describe the entity as it pitches itself today, never from memory. Second, if an entity's month of evidence directly bears on its pitch - SUPPORTS a specific claim, CUTS AGAINST one, or the conversation is squarely ABOUT the pitched ground - say so in ONE prose sentence inside that entity's section of the comparison synthesis (right after the Community Sentiment line - the template marks the slot), anchored to the real item with its engagement. When the pulse is orthogonal to the pitch (on-entity but about something the pitch doesn't speak to), say NOTHING about the pitch: omission is the correct output, and a manufactured connection is worse than silence. Match altitude: test SPECIFIC claims ("zero-config", "fastest", an uptime number) against specific threads; never grade a broad tagline ("financial infrastructure") against an individual thread - it is too broad to hit or miss. Keep claims windowed - "this month's conversation" - never trend verbs like "losing the narrative" that one 30-day window cannot support. If positioning was not actually fetched this run for an entity, skip both uses for that entity - never supply a pitch from memory.
+**Use `RESOLVED_POSITIONING` per entity (Step 0.55 item 6) in two ways.** First, ground each entity's `What it is` cell in its CURRENT fetched pitch - describe the entity as it pitches itself today, never from memory. Second, if an entity's month of evidence directly bears on its pitch - SUPPORTS a specific claim, CUTS AGAINST one, or the conversation is squarely ABOUT the pitched ground - say so in ONE prose sentence inside that entity's section of the comparison synthesis (right after the Community Sentiment line - the template marks the slot), anchored to the real, well-engaged item, named without its count. When the pulse is orthogonal to the pitch (on-entity but about something the pitch doesn't speak to), say NOTHING about the pitch: omission is the correct output, and a manufactured connection is worse than silence. Match altitude: test SPECIFIC claims ("zero-config", "fastest", an uptime number) against specific threads; never grade a broad tagline ("financial infrastructure") against an individual thread - it is too broad to hit or miss. Keep claims windowed - "this month's conversation" - never trend verbs like "losing the narrative" that one 30-day window cannot support. If positioning was not actually fetched this run for an entity, skip both uses for that entity - never supply a pitch from memory.
 
 **Use the applicable comparison invocation above in place of the research runbook's Step 1 command.** Run the runbook's Step 2 supplements when host web search is available and Step 2.5 appendix (comparison runs append to every per-entity file), then write the body with the comparison template below instead of the general template in `synthesis.md`.
 
@@ -145,7 +145,7 @@ Voice contract LAWs 1, 3, 5 apply to comparisons unchanged (omit unnecessary tra
 **Required comparison structure (match the April 9 exemplar):**
 
 ````
-🌐 last30days v{VERSION} · synced {YYYY-MM-DD}
+{the engine's first line, copied verbatim}
 
 # {TOPIC_A} vs {TOPIC_B} [vs {TOPIC_C}]: What the Community Says (/Last30Days)
 
@@ -157,7 +157,7 @@ Voice contract LAWs 1, 3, 5 apply to comparisons unchanged (omit unnecessary tra
 
 **Community Sentiment:** [Positive / Mixed / Negative / Enthusiastic / Security-concerned / etc.] ({N}+ mentions across {source list})
 
-[Optional pitch-vs-pulse sentence - ONLY if `RESOLVED_POSITIONING` was captured for this entity AND the month's evidence directly supports a specific claim, cuts against one, or is squarely about the pitched ground: one windowed prose sentence anchored to a real item with engagement. Otherwise omit entirely - silence, not a placeholder.]
+[Optional pitch-vs-pulse sentence - ONLY if `RESOLVED_POSITIONING` was captured for this entity AND the month's evidence directly supports a specific claim, cuts against one, or is squarely about the pitched ground: one windowed prose sentence anchored to a real, well-engaged item, named without its count. Otherwise omit entirely - silence, not a placeholder.]
 
 **Strengths (what people love)**
 - [Specific strength with `per <source>` attribution]
@@ -220,11 +220,14 @@ I've compared {TOPIC_A} vs {TOPIC_B} [vs ...] using the latest community data. S
 - [follow-up on the emerging-stack combination pattern]
 ````
 
+**On Claude Code** (`CLAUDECODE` set), `references/synthesis.md` NO MARKDOWN LISTS applies here too: write the Strengths, Weaknesses, and follow-up bullets as `• ` lines, not `- ` lists.
+
 **Do NOT:**
 - Use `What I learned:` prose label (that is general-query voice)
 - Use bold-lead-in paragraphs with ` - ` separators for the body (that is general-query voice)
 - Use a `KEY PATTERNS from the research:` numbered list (replaced by per-entity Strengths/Weaknesses bullets and the emerging-stack paragraph)
 - Fabricate a `## Notable Stats` block (the engine footer IS the stats block, LAW 5)
+- Attach like, upvote, view, or point counts to quotes and attributions, or add pulled-quote lines (`references/synthesis.md` COUNTS IN PROSE; entity scale figures stay)
 - Produce section headers outside the six listed above (`## Quick Verdict`, `## {Entity}` per entity, `## Head-to-Head`, `## The Bottom Line`, `## The emerging stack` are the only allowed `##` headers per LAW 4 comparison exception)
 
 **Reference exemplar:** `$LAST30DAYS_MEMORY_DIR/openclaw-vs-hermes-vs-paperclip-LAUNCH-VIDEO-april9-exemplar.md` preserves the April 9 canonical output with full structural analysis. Match this shape section-for-section.

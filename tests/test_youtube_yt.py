@@ -125,7 +125,10 @@ class TestYtDlpSubLangs(unittest.TestCase):
             self.assertEqual(youtube_yt._ytdlp_sub_langs(), "en,es,pt")
 
     def test_transcript_cmd_uses_default_sub_langs(self):
-        """Regression: the --sub-lang arg is en,es,pt by default (issue #469)."""
+        """Regression: the --sub-lang arg covers en,es,pt by default (issue #469).
+
+        Each language is requested original-speech first (#1314).
+        """
         with tempfile.TemporaryDirectory() as temp_dir, \
              mock.patch.dict(os.environ, {}, clear=False), \
              mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
@@ -137,7 +140,7 @@ class TestYtDlpSubLangs(unittest.TestCase):
         self.assertEqual(transcript, "Offline transcript fixture.")
         cmd = run_mock.call_args_list[0].args[0]
         idx = cmd.index("--sub-lang")
-        self.assertEqual(cmd[idx + 1], "en,es,pt")
+        self.assertEqual(cmd[idx + 1], "en-orig,es-orig,pt-orig,en,es,pt")
 
     def test_transcript_cmd_respects_env_var_override(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
@@ -150,7 +153,80 @@ class TestYtDlpSubLangs(unittest.TestCase):
         self.assertEqual(transcript, "Offline transcript fixture.")
         cmd = run_mock.call_args_list[0].args[0]
         idx = cmd.index("--sub-lang")
-        self.assertEqual(cmd[idx + 1], "fr,de,it")
+        self.assertEqual(cmd[idx + 1], "fr-orig,de-orig,it-orig,fr,de,it")
+
+    def test_transcript_cmd_requests_uploaded_and_auto_subtitles(self):
+        """#1313: manual-only subtitles must not exit 0 with no file."""
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             mock.patch.object(youtube_yt.subproc, "run_with_timeout", return_value=self._fake_result()) as run_mock:
+            _write_transcript_fixture(temp_dir)
+            youtube_yt._fetch_transcript_ytdlp("abc123", temp_dir)
+
+        cmd = run_mock.call_args_list[0].args[0]
+        self.assertIn("--write-subs", cmd)
+        self.assertIn("--write-auto-subs", cmd)
+
+    def test_ssh_transcript_cmd_requests_uploaded_subs_and_orig_first(self):
+        from lib.subproc import SubprocResult
+        result = SubprocResult(returncode=0, stdout="WEBVTT\n", stderr="")
+        with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "en"}), \
+             mock.patch.object(youtube_yt, "_run_ytdlp", return_value=result) as run_mock:
+            youtube_yt._fetch_transcript_ytdlp_via_ssh("abc123", "macmini")
+
+        remote_script = run_mock.call_args.args[0][-1]
+        self.assertIn("--write-subs --write-auto-subs --sub-lang en-orig,en ", remote_script)
+
+    def test_request_langs_do_not_double_explicit_orig(self):
+        with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": "fr,en-orig,en"}):
+            self.assertEqual(youtube_yt._ytdlp_request_langs(), "fr-orig,en-orig,fr,en")
+
+    def test_vtt_matching_prefers_plain_track_within_a_language(self):
+        """A plain track that downloaded may be the uploaded subtitle; keep it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name in ("abc123.en.vtt", "abc123.en-orig.vtt", "abc123.es-orig.vtt"):
+                (Path(temp_dir) / name).write_text("WEBVTT\n")
+            picked = youtube_yt._pick_ytdlp_vtt("abc123", temp_dir, ["en", "es", "pt"])
+        self.assertEqual(picked.name, "abc123.en.vtt")
+
+    def test_vtt_matching_falls_back_to_orig_track(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name in ("abc123.en-orig.vtt", "abc123.es.vtt"):
+                (Path(temp_dir) / name).write_text("WEBVTT\n")
+            picked = youtube_yt._pick_ytdlp_vtt("abc123", temp_dir, ["en", "es", "pt"])
+        self.assertEqual(picked.name, "abc123.en-orig.vtt")
+
+    def test_configured_orig_code_keeps_its_language_priority(self):
+        """`en-orig` in SUB_LANGS ranks English first, not after every listed code."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name in ("abc123.fr.vtt", "abc123.en-orig.vtt"):
+                (Path(temp_dir) / name).write_text("WEBVTT\n")
+            picked = youtube_yt._pick_ytdlp_vtt("abc123", temp_dir, ["en-orig", "fr"])
+        self.assertEqual(picked.name, "abc123.en-orig.vtt")
+
+    def test_dubbed_video_keeps_orig_track_after_plain_track_429(self):
+        """#1314: `en` 429s after `en-orig` downloaded; keep it, no retry, no SC."""
+        from lib.subproc import SubprocResult
+        failed = SubprocResult(
+            returncode=1, stdout="",
+            stderr="ERROR: Unable to download video subtitles for 'en': HTTP Error 429: Too Many Requests",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def _run(cmd, timeout, **_kwargs):
+                (Path(temp_dir) / "dub123.en-orig.vtt").write_text(
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nOriginal speech captions.\n",
+                )
+                return failed
+
+            with mock.patch.dict(os.environ, {"LAST30DAYS_YT_SUB_LANGS": ""}), \
+                 mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(youtube_yt, "_ytdlp_ssh_host", return_value=None), \
+                 mock.patch.object(youtube_yt, "_run_ytdlp", side_effect=_run) as run_mock, \
+                 mock.patch.object(youtube_yt, "_sc_fetch_transcript") as sc_mock:
+                transcript = youtube_yt.fetch_transcript("dub123", temp_dir, token="dummy-key")
+
+        self.assertEqual(transcript, "Original speech captions.")
+        self.assertEqual(run_mock.call_count, 1)
+        sc_mock.assert_not_called()
 
     def test_vtt_matching_picks_non_english_track(self):
         """When yt-dlp writes a Spanish track (no English available), we read it."""
@@ -531,7 +607,7 @@ class TestTranscriptCandidateSortKey(unittest.TestCase):
 
         call_args_list = []
 
-        def fake_fetch(video_ids, max_workers=5, out_captions_disabled=None, token=None):
+        def fake_fetch(video_ids, max_workers=5, out_captions_disabled=None, token=None, **_kwargs):
             call_args_list.extend(video_ids)
             return {vid: "transcript" for vid in video_ids}
 
@@ -572,7 +648,7 @@ class TestSearchAndTranscribe(unittest.TestCase):
         ]
 
         # fetch_transcripts_parallel returns None for music videos, text for talks
-        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None):
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None, **_kwargs):
             result = {}
             for vid in video_ids:
                 if vid.startswith("talk"):
@@ -642,7 +718,7 @@ class TestTranscriptFetchStats(unittest.TestCase):
 
     def _run(self, items, fake_parallel=None):
         if fake_parallel is None:
-            def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None):
+            def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None, **_kwargs):
                 return {vid: "A detailed transcript about the topic." for vid in video_ids}
         with mock.patch.object(youtube_yt, "search_youtube", return_value={"items": items}), \
              mock.patch.object(youtube_yt, "fetch_transcripts_parallel", side_effect=fake_parallel):
@@ -657,7 +733,7 @@ class TestTranscriptFetchStats(unittest.TestCase):
             self._make_item("nocap1", 1_000, "2026-03-10"),
         ]
 
-        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None):
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None, **_kwargs):
             result = {}
             for vid in video_ids:
                 if vid.startswith("nocap"):
@@ -970,7 +1046,7 @@ class TestScTranscriptFallback(unittest.TestCase):
         """fetch_transcripts_parallel passes the token to every fetch_transcript."""
         captured = {}
 
-        def _fake_fetch_transcript(video_id, temp_dir, status=None, token=None):
+        def _fake_fetch_transcript(video_id, temp_dir, status=None, token=None, **_kwargs):
             captured[video_id] = token
             return None
 
@@ -986,7 +1062,7 @@ class TestScTranscriptFallback(unittest.TestCase):
         doesn't look like nothing went wrong."""
         logs = []
 
-        def _rescued_fetch_transcript(video_id, temp_dir, status=None, token=None):
+        def _rescued_fetch_transcript(video_id, temp_dir, status=None, token=None, **_kwargs):
             if status is not None:
                 status["sc_rescued"] = True
             return "rescued transcript"
@@ -1007,7 +1083,7 @@ class TestScTranscriptFallback(unittest.TestCase):
         needed the ScrapeCreators fallback — no rescue tag should appear."""
         logs = []
 
-        def _plain_fetch_transcript(video_id, temp_dir, status=None, token=None):
+        def _plain_fetch_transcript(video_id, temp_dir, status=None, token=None, **_kwargs):
             return "a normal transcript"
 
         with mock.patch.object(youtube_yt, "fetch_transcript",
@@ -1165,6 +1241,19 @@ class TestScTranscriptParsing(unittest.TestCase):
         self.assertEqual(
             [c.kwargs["params"]["language"] for c in get_mock.call_args_list],
             ["fr", "de", "ja"],
+        )
+
+    def test_orig_codes_are_sent_to_sc_as_plain_languages(self):
+        """#1314: SC never receives a yt-dlp-only `-orig` language code."""
+        with mock.patch.dict(
+            os.environ, {"LAST30DAYS_YT_SUB_LANGS": "en-orig,en,es"},
+        ), mock.patch.object(
+            youtube_yt.http, "get", return_value={"transcript": None},
+        ) as get_mock:
+            youtube_yt._sc_fetch_transcript("vidOrig", "key")
+        self.assertEqual(
+            [c.kwargs["params"]["language"] for c in get_mock.call_args_list],
+            ["en", "es"],
         )
 
     def test_empty_caption_segments_do_not_stop_language_fallback(self):
@@ -1899,6 +1988,133 @@ class TestYoutubeProxy(unittest.TestCase):
             cmd = ["yt-dlp", "--ignore-config", "ytsearch5:test", "--dump-json"]
             result = youtube_yt._wrap_ytdlp_cmd(cmd)
         self.assertNotIn("--proxy", result)
+
+
+class TestYouTubeUploadDateFallback(unittest.TestCase):
+    """A relevance search full of old catalog videos retries with YouTube's upload-date filter."""
+
+    def setUp(self):
+        youtube_yt.reset_search_cache()
+        self.addCleanup(youtube_yt.reset_search_cache)
+        today = datetime.now(timezone.utc).date()
+        self.TO = today.isoformat()
+        self.FROM = (today - timedelta(days=30)).isoformat()
+        self.recent = [(today - timedelta(days=n)).isoformat() for n in (1, 2)]
+
+    @staticmethod
+    def _stdout(prefix, dates):
+        return "\n".join(
+            json.dumps({
+                "id": f"{prefix}{i}", "title": f"Kanye West video {i}", "view_count": 100 + i,
+                "like_count": 1, "comment_count": 1, "upload_date": d.replace("-", ""),
+                "description": "desc",
+            })
+            for i, d in enumerate(dates)
+        )
+
+    def _search(self, relevance_dates, filtered_dates, freshness_mode="strict_recent",
+                from_date=None, to_date=None, relevance_rc=0, relevance_stderr="",
+                filtered_rc=0, filtered_stderr=""):
+        from lib.subproc import SubprocResult
+        calls = []
+
+        def _run(cmd, timeout, **_kwargs):
+            calls.append(cmd)
+            if any("youtube.com/results" in arg for arg in cmd):
+                return SubprocResult(
+                    returncode=filtered_rc, stdout=self._stdout("new", filtered_dates),
+                    stderr=filtered_stderr,
+                )
+            return SubprocResult(
+                returncode=relevance_rc, stdout=self._stdout("old", relevance_dates),
+                stderr=relevance_stderr,
+            )
+
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=True), \
+             mock.patch.object(youtube_yt, "_ytdlp_ssh_host", return_value=None), \
+             mock.patch.object(youtube_yt, "_run_ytdlp", side_effect=_run):
+            out = youtube_yt.search_youtube(
+                "Kanye West", from_date or self.FROM, to_date or self.TO,
+                freshness_mode=freshness_mode,
+            )
+        return out, calls
+
+    def test_catalog_topic_returns_recent_uploads_from_filtered_search(self):
+        out, calls = self._search(["2010-11-22", "2013-06-18"], self.recent)
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"new0", "new1"})
+        self.assertEqual(len(calls), 2)
+        url = next(arg for arg in calls[1] if "youtube.com/results" in arg)
+        self.assertIn("search_query=kanye+west", url.lower())
+        self.assertIn("sp=EgIIBA%3D%3D", url)  # "this month"
+
+    def test_week_window_uses_this_week_filter(self):
+        from_date = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+        _, calls = self._search(["2010-11-22"], self.recent, from_date=from_date)
+        url = next(arg for arg in calls[1] if "youtube.com/results" in arg)
+        self.assertIn("sp=EgIIAw%3D%3D", url)
+
+    def test_filtered_results_merge_with_in_window_relevance_hits(self):
+        out, _ = self._search([self.recent[0], "2010-11-22"], [self.recent[1]])
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"old0", "new0"})
+
+    def test_no_fallback_when_relevance_search_already_has_three_recent(self):
+        out, calls = self._search(self.recent + [self.recent[0]], self.recent)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(out["items"]), 3)
+
+    def test_no_fallback_for_evergreen_topics(self):
+        out, calls = self._search(["2010-11-22", "2013-06-18"], self.recent, freshness_mode="evergreen_ok")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"old0", "old1"})
+
+    def test_age_restricted_result_does_not_block_the_fallback(self):
+        """One age-gated video in the results is not a bot block."""
+        out, calls = self._search(
+            ["2010-11-22"], self.recent, relevance_rc=1,
+            relevance_stderr="ERROR: [youtube] abc: Sign in to confirm your age. Use --cookies",
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"new0", "new1"})
+
+    def test_all_age_gated_relevance_hits_still_reach_the_fallback(self):
+        """Every hit age-gated leaves stdout empty; the retry must still run."""
+        out, calls = self._search(
+            [], self.recent, relevance_rc=1,
+            relevance_stderr="ERROR: [youtube] abc: Sign in to confirm your age. Use --cookies",
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({i["video_id"] for i in out["items"]}, {"new0", "new1"})
+        self.assertNotIn("error", out)
+
+    def test_failed_retry_is_reported_instead_of_a_quiet_zero(self):
+        out, calls = self._search(
+            ["2010-11-22"], [], filtered_rc=1,
+            filtered_stderr="ERROR: HTTP Error 429: Too Many Requests",
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out["items"], [])
+        self.assertIn("upload-date search failed", out["error"])
+
+    def test_failed_retry_keeps_relevance_hits_without_an_error(self):
+        out, _ = self._search(
+            [self.recent[0]], [], filtered_rc=1,
+            filtered_stderr="ERROR: HTTP Error 429: Too Many Requests",
+        )
+        self.assertEqual([i["video_id"] for i in out["items"]], ["old0"])
+        self.assertNotIn("error", out)
+
+    def test_bot_block_skips_the_fallback(self):
+        _, calls = self._search(
+            ["2010-11-22"], self.recent, relevance_rc=1,
+            relevance_stderr="ERROR: [youtube] abc: Sign in to confirm you're not a bot.",
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_no_fallback_for_past_as_of_window(self):
+        """YouTube's upload filters count back from now, so a past window cannot use them."""
+        out, calls = self._search(["2010-11-22"], ["2024-03-01"], from_date="2024-02-01", to_date="2024-03-02")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["items"], [])
 
 
 class TestYouTubeDateWindowByFreshnessMode(unittest.TestCase):

@@ -4,6 +4,7 @@ import unittest
 
 from lib.query import (
     NOISE_WORDS,
+    PREFIXES,
     SOCIAL_NOISE,
     VIRAL_NOISE,
     extract_compound_terms,
@@ -35,6 +36,24 @@ class TestExtractCoreSubject(unittest.TestCase):
     def test_empty_string(self):
         self.assertEqual(extract_core_subject(""), "")
 
+    def test_second_person_use_prefixes_are_stripped(self):
+        self.assertEqual(extract_core_subject("how do you use Cursor"), "cursor")
+        self.assertEqual(extract_core_subject("how can I use Cursor"), "cursor")
+
+    def test_bare_how_do_you_and_how_can_i_are_stripped(self):
+        self.assertEqual(extract_core_subject("how can I debug docker"), "debug docker")
+        self.assertEqual(extract_core_subject("how do you deploy Next.js"), "deploy next.js")
+
+    def test_prefixes_are_ordered_longest_first(self):
+        """Prefix stripping stops after the first match, so a shorter prefix
+        listed before a longer one it leads would shadow it."""
+        for i, shorter in enumerate(PREFIXES):
+            for longer in PREFIXES[i + 1:]:
+                self.assertFalse(
+                    longer.startswith(shorter + " "),
+                    f"{shorter!r} is listed before {longer!r} and would shadow it",
+                )
+
     def test_all_noise_returns_original(self):
         # When all words are noise, fall back to original text
         result = extract_core_subject("best latest new")
@@ -58,6 +77,13 @@ class TestMaxWords(unittest.TestCase):
     def test_max_words_none_no_cap(self):
         result = extract_core_subject("cursor IDE react native components")
         self.assertEqual(result, "cursor ide react native components")
+
+    def test_max_words_strips_trailing_punctuation(self):
+        self.assertEqual(extract_core_subject("What is Claude Code?", max_words=5), "claude code")
+
+    def test_trailing_punctuation_does_not_hide_last_noise_word(self):
+        result = extract_core_subject("Claude Code best practices?", max_words=5, strip_suffixes=True)
+        self.assertEqual(result, "claude code")
 
     def test_max_words_fallback_on_empty(self):
         # All words filtered + max_words should fall back to original

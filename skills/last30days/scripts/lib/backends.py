@@ -45,6 +45,7 @@ JSON never names a non-official backend there unless it is pinned.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from shutil import which
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -138,8 +139,10 @@ class ChainDescriptor:
     source: str
     mode: str
     backends: Tuple[BackendSpec, ...]
-    pin_var: Optional[str] = None   # env var pin (X, Reddit)
+    pin_var: Optional[str] = None   # env var pin (X, Reddit, YouTube)
     pin_flag: Optional[str] = None  # CLI flag pin (web: --web-backend)
+    # Env pin values the runtime honors; None means any backend name.
+    pin_values: Optional[Tuple[str, ...]] = None
 
 
 @dataclass
@@ -304,13 +307,31 @@ def _probe_grok(config: Dict[str, Any]) -> BackendFinding:
                 "then run `grok login`"
             ),
         )
+    from . import grok_audit
+
+    audit = grok_audit.cached_status(os.path.realpath(which("grok")))
+    if audit and audit["verdict"] == grok_audit.FAIL:
+        return BackendFinding(
+            name="grok",
+            status=health.ERROR,
+            requires=requires,
+            detail=f"{audit['version']} failed the grok tool-boundary audit ({audit['check']})",
+            prescription=(
+                "update the grok CLI or use another X backend; "
+                "running `doctor` again clears this result so the next run re-audits"
+            ),
+        )
+    if audit:
+        audit_note = f"; {audit['version']} passed the tool-boundary audit"
+    else:
+        audit_note = "; this grok build is audited on its first run (local, no credits)"
     store_status, store_detail, expires_at = grok_x.stored_auth_status()
     if store_status == grok_x.AUTH_OK:
         return BackendFinding(
             name="grok",
             status=health.OK,
             requires=requires,
-            detail=f"{store_detail} (not live-verified until a run)",
+            detail=f"{store_detail} (not live-verified until a run){audit_note}",
         )
     if store_status == grok_x.AUTH_EXPIRED:
         expiry_str = expires_at.isoformat() if expires_at else "unknown"
@@ -538,7 +559,8 @@ DESCRIPTORS: Dict[str, ChainDescriptor] = {
             ),
             _SC_SPEC,
         ),
-        pin_var=None,  # no YouTube pin knob exists
+        pin_var=env.YOUTUBE_BACKEND_PIN_VAR,
+        pin_values=env.YOUTUBE_BACKEND_PIN_VALUES,
     ),
     "web": ChainDescriptor(
         source="web",
@@ -678,8 +700,14 @@ def _resolve_alternative(
     if pin and pin not in ("auto", "none") and pin in by_name:
         pin_name = pin
     elif descriptor.pin_var:
-        raw = (config.get(descriptor.pin_var) or "").lower()
-        if raw in by_name:
+        if descriptor.pin_var == env.YOUTUBE_BACKEND_PIN_VAR:
+            # Same spelling rules as the runtime gate (strip, "ytdlp" alias).
+            raw = env.youtube_backend_pin(config)
+        else:
+            raw = (config.get(descriptor.pin_var) or "").lower()
+        if raw in by_name and (
+            descriptor.pin_values is None or raw in descriptor.pin_values
+        ):
             pin_name = raw
 
     if pin_name:

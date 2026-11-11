@@ -1,10 +1,13 @@
 """Tests for reddit_arctic — keyless post-score lookup via arctic-shift (U6)."""
 
+import socket
 from unittest import mock
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from lib import reddit_arctic
+from lib import reddit_arctic, reddit_keyless
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +73,19 @@ def _listing_row(pid="abc123", title="matcha farm tour", score=406, ncmt=88,
     }
 
 
+@pytest.fixture
+def listing_clock(monkeypatch):
+    now = [0.0]
+
+    def advance(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(reddit_arctic.time, "time", lambda: now[0])
+    monkeypatch.setattr(reddit_arctic.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(reddit_arctic.time, "sleep", advance)
+    return advance
+
+
 class TestFetchListings:
     """fetch_listings serves scored subreddit listings from the archive —
     the keyless fallback for hosts where shreddit partials 403."""
@@ -92,8 +108,10 @@ class TestFetchListings:
         assert post["url"].startswith("https://www.reddit.com/r/tea/comments/")
         assert post["why_relevant"] == "Reddit listing (arctic-shift)"
         # one call per subreddit, recent-first, depth-default volume
-        assert "subreddit=tea" in g.call_args[0][0]
-        assert "limit=25" in g.call_args[0][0]
+        assert g.call_count == 1
+        assert parse_qs(urlsplit(g.call_args[0][0]).query) == {
+            "subreddit": ["tea"], "limit": ["25"], "sort": ["desc"],
+        }
 
     def test_strips_r_prefix_and_skips_all(self):
         with mock.patch.object(reddit_arctic.http, "get",
@@ -102,7 +120,7 @@ class TestFetchListings:
         assert len(out) == 1
         assert g.call_count == 1  # only r/tea fetched; "all"/"" skipped
 
-    def test_processes_all_subreddits_no_cap(self):
+    def test_processes_all_subreddits_no_cap(self, listing_clock):
         """All requested subreddits are processed (no hard cap)."""
         subs = [f"sub{i}" for i in range(20)]
         with mock.patch.object(reddit_arctic.http, "get",
@@ -183,3 +201,271 @@ class TestFetchListings:
         with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)):
             out = reddit_arctic.fetch_scores(["ok", "bad"])
         assert out == {"ok": {"score": 7, "num_comments": 3}}
+
+
+class TestWindowedFetchListings:
+    def test_dns_retries_cannot_spend_other_subreddits_request_time(self, listing_clock):
+        requested = []
+
+        def open_request(request, timeout):
+            requested.append(parse_qs(urlsplit(request.full_url).query)["subreddit"][0])
+            listing_clock(timeout)
+            raise URLError(socket.gaierror(socket.EAI_AGAIN, "temporary DNS failure"))
+
+        with mock.patch.object(reddit_arctic.http, "_open_request", side_effect=open_request):
+            out = reddit_arctic.fetch_listings(
+                ["tea", "coffee", "cocoa"], from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert out == []
+        assert requested == ["tea", "coffee", "cocoa"]
+        assert reddit_arctic.time.monotonic() <= reddit_arctic._LISTING_DEADLINE_SECONDS
+
+    def test_slow_first_subreddit_does_not_starve_other_subreddits(self, listing_clock):
+        requested = []
+
+        def get(url, **kwargs):
+            sub = parse_qs(urlsplit(url).query)["subreddit"][0]
+            requested.append(sub)
+            listing_clock(kwargs["timeout"])
+            if sub == "tea":
+                raise TimeoutError("slow subreddit")
+            return _resp([_listing_row(
+                pid=sub, subreddit=sub, permalink=f"/r/{sub}/comments/{sub}/x/",
+            )])
+
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=get):
+            out = reddit_arctic.fetch_listings(
+                ["tea", "coffee", "cocoa"], from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert requested == ["tea", "coffee", "cocoa"]
+        assert [post["subreddit"] for post in out] == ["coffee", "cocoa"]
+        assert reddit_arctic.time.time() <= reddit_arctic._LISTING_DEADLINE_SECONDS
+
+    @pytest.mark.parametrize(("start", "end", "boundaries"), [
+        ("2026-09-20", "2026-10-20", [
+            ("2026-09-20", "2026-09-28"),
+            ("2026-09-28", "2026-10-06"),
+            ("2026-10-06", "2026-10-14"),
+            ("2026-10-14", "2026-10-20"),
+        ]),
+        ("2026-10-19", "2026-10-20", [("2026-10-19", "2026-10-20")]),
+    ])
+    def test_slices_cover_requested_boundaries(self, listing_clock, start, end, boundaries):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([])) as get:
+            reddit_arctic.fetch_listings(["tea"], from_date=start, to_date=end)
+
+        queries = [parse_qs(urlsplit(call.args[0]).query) for call in get.call_args_list]
+        assert [(query["after"][0], query["before"][0]) for query in queries] == boundaries
+        assert all(query["limit"] == ["100"] and query["sort"] == ["desc"] for query in queries)
+
+    def test_visits_every_subreddit_before_the_next_slice(self, listing_clock):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([])) as get:
+            reddit_arctic.fetch_listings(
+                ["tea", "coffee"], from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        queries = [parse_qs(urlsplit(call.args[0]).query) for call in get.call_args_list]
+        assert [query["subreddit"][0] for query in queries] == ["tea", "coffee"] * 4
+        assert [query["after"][0] for query in queries] == [
+            "2026-09-20", "2026-09-20", "2026-09-28", "2026-09-28",
+            "2026-10-06", "2026-10-06", "2026-10-14", "2026-10-14",
+        ]
+
+    def test_keeps_highest_scores_across_slices_per_subreddit(self, listing_clock):
+        scores = {"tea": iter([500, 1, 300, 2]), "coffee": iter([4, 70, 10, 60])}
+
+        def get(url, **kwargs):
+            sub = parse_qs(urlsplit(url).query)["subreddit"][0]
+            score = next(scores[sub])
+            return _resp([_listing_row(
+                pid=f"{sub}{score}", subreddit=sub, score=str(score),
+                permalink=f"/r/{sub}/comments/{sub}{score}/x/",
+            )])
+
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=get):
+            out = reddit_arctic.fetch_listings(
+                ["tea", "coffee"], limit=2, from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert [(post["subreddit"], post["score"]) for post in out] == [
+            ("tea", 500), ("tea", 300), ("coffee", 70), ("coffee", 60),
+        ]
+
+    def test_duplicate_slice_rows_do_not_consume_selection_slots(self, listing_clock):
+        best = _listing_row(score=100)
+        second = _listing_row(pid="second", score=90, permalink="/r/tea/comments/second/x/")
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=[
+            _resp([best]), _resp([best, second]), _resp([]), _resp([]),
+        ]):
+            out = reddit_arctic.fetch_listings(
+                ["tea"], limit=2, from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert [post["metadata"]["post_id"] for post in out] == ["abc123", "second"]
+
+    @pytest.mark.parametrize("failure", [TimeoutError("unreachable"), {"data": None}])
+    def test_failed_slice_keeps_other_slices(self, listing_clock, failure):
+        later = _listing_row(pid="later", score=900, permalink="/r/tea/comments/later/x/")
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=[
+            _resp([_listing_row()]), failure, _resp([later]), _resp([]),
+        ]) as get:
+            out = reddit_arctic.fetch_listings(
+                ["tea"], from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert get.call_count == 4
+        assert [post["metadata"]["post_id"] for post in out] == ["later", "abc123"]
+
+    def test_deadline_keeps_best_posts_from_completed_slices(self, listing_clock):
+        scores = iter([10, 90, 70, 1000])
+        timeouts = []
+
+        def get(url, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            listing_clock(kwargs["timeout"])
+            score = next(scores)
+            return _resp([_listing_row(
+                pid=str(score), score=score, permalink=f"/r/tea/comments/{score}/x/",
+            )])
+
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=get):
+            out = reddit_arctic.fetch_listings(
+                ["tea"], limit=2, from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert [post["score"] for post in out] == [90, 70]
+        assert timeouts == pytest.approx([15, 15, 14.2])
+        assert reddit_arctic.time.time() <= reddit_arctic._LISTING_DEADLINE_SECONDS
+
+    def test_pacing_does_not_start_request_after_deadline(self, listing_clock):
+        def get(url, **kwargs):
+            listing_clock(0.8)
+            return _resp([_listing_row()])
+
+        with mock.patch.object(reddit_arctic, "_LISTING_DEADLINE_SECONDS", 1), \
+             mock.patch.object(reddit_arctic.http, "get", side_effect=get) as request:
+            out = reddit_arctic.fetch_listings(
+                ["tea", "coffee"], from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert request.call_count == 1
+        assert [post["metadata"]["post_id"] for post in out] == ["abc123"]
+        assert reddit_arctic.time.time() == pytest.approx(1)
+
+    def test_discovery_forwards_dates_to_dedicated_and_category_listings(self, listing_clock):
+        queries = []
+
+        def get(url, **kwargs):
+            query = parse_qs(urlsplit(url).query)
+            queries.append(query)
+            sub = query["subreddit"][0]
+            return _resp([_listing_row(
+                pid=sub, subreddit=sub, permalink=f"/r/{sub}/comments/{sub}/x/",
+            )])
+
+        with mock.patch.object(reddit_keyless.reddit_search, "search", return_value=[]), \
+             mock.patch.object(reddit_keyless.reddit_listing, "fetch_listings", return_value=[]), \
+             mock.patch.object(reddit_arctic.http, "get", side_effect=get):
+            out = reddit_keyless._discover(
+                "matcha", "quick", ["tea"], dedicated_subreddits=["matcha"],
+                from_date="2026-09-20", to_date="2026-10-20",
+            )
+
+        assert [post["subreddit"] for post in out] == ["matcha", "tea"]
+        assert out[0]["dedicated"] is True
+        for sub in ("matcha", "tea"):
+            sub_queries = [query for query in queries if query["subreddit"] == [sub]]
+            assert len(sub_queries) == 4
+            assert sub_queries[0]["after"] == ["2026-09-20"]
+            assert sub_queries[-1]["before"] == ["2026-10-20"]
+
+
+def _comment_row(pid="mjwb1hg", author="u", body="great thread", score=42,
+                 created=1783000000, permalink="/r/tea/comments/abc123/x/mjwb1hg/"):
+    return {
+        "id": pid, "author": author, "body": body, "score": score,
+        "created_utc": created, "permalink": permalink, "link_id": "t3_abc123",
+    }
+
+
+class TestFetchPostComments:
+    """fetch_post_comments serves a post's top comments from the archive —
+    the keyless fallback for hosts where the shreddit comment partials 403."""
+
+    def test_returns_normalized_comments_sorted_desc(self):
+        rows = [_comment_row(score=1), _comment_row(score=99), _comment_row(score=42)]
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)) as g:
+            out = reddit_arctic.fetch_post_comments("abc123", limit=10)
+        assert [c["score"] for c in out] == [99, 42, 1]
+        first = out[0]
+        assert first["author"] == "u"
+        assert first["body"] == "great thread"
+        assert first["excerpt"] == "great thread"
+        assert first["date"] == "2026-07-02"
+        assert first["url"] == "https://reddit.com/r/tea/comments/abc123/x/mjwb1hg/"
+        # link_id uses the t3_ prefix; wide recency slice, ranked client-side
+        assert "link_id=t3_abc123" in g.call_args[0][0]
+        assert f"limit={reddit_arctic.MAX_COMMENT_ROWS}" in g.call_args[0][0]
+
+    def test_request_bounded_by_single_deadline(self):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([])) as g, \
+             mock.patch.object(reddit_arctic.time, "monotonic", return_value=100.0):
+            reddit_arctic.fetch_post_comments("abc123")
+        kwargs = g.call_args.kwargs
+        assert kwargs["retries"] == 1
+        assert kwargs["deadline_monotonic"] == 100.0 + reddit_arctic.TIMEOUT
+
+    def test_caller_deadline_clamps_request(self):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([])) as g, \
+             mock.patch.object(reddit_arctic.time, "monotonic", return_value=100.0):
+            reddit_arctic.fetch_post_comments("abc123", deadline=105.0)
+        assert g.call_args.kwargs["deadline_monotonic"] == 105.0
+        assert g.call_args.kwargs["timeout"] == 5.0
+
+    def test_spent_budget_skips_request(self):
+        with mock.patch.object(reddit_arctic.http, "get") as g, \
+             mock.patch.object(reddit_arctic.time, "monotonic", return_value=100.0):
+            assert reddit_arctic.fetch_post_comments("abc123", deadline=100.5) == []
+        g.assert_not_called()
+
+    def test_strips_t3_prefix_from_post_id(self):
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp([_comment_row()])) as g:
+            reddit_arctic.fetch_post_comments("t3_abc123")
+        assert "link_id=t3_abc123" in g.call_args[0][0]
+
+    def test_limit_capped(self):
+        rows = [_comment_row(score=i) for i in range(5)]
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)):
+            out = reddit_arctic.fetch_post_comments("abc123", limit=2)
+        assert len(out) == 2
+
+    def test_deleted_and_removed_filtered(self):
+        rows = [_comment_row(author="[deleted]"), _comment_row(body="[removed]"),
+                _comment_row(score=7)]
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)):
+            out = reddit_arctic.fetch_post_comments("abc123")
+        assert len(out) == 1 and out[0]["score"] == 7
+
+    def test_skip_author_filters_before_limit(self):
+        rows = [_comment_row(author="AutoModerator", score=500), _comment_row(score=7)]
+        with mock.patch.object(reddit_arctic.http, "get", return_value=_resp(rows)):
+            out = reddit_arctic.fetch_post_comments(
+                "abc123", limit=1, skip_author=lambda a: a == "AutoModerator")
+        assert [c["score"] for c in out] == [7]
+
+    def test_network_error_degrades_to_empty(self):
+        with mock.patch.object(reddit_arctic.http, "get", side_effect=Exception("boom")):
+            assert reddit_arctic.fetch_post_comments("abc123") == []
+
+    def test_rate_limit_response_degrades_to_empty(self):
+        with mock.patch.object(reddit_arctic.http, "get",
+                               return_value={"error": "Timeout. Maybe slow down a bit"}):
+            assert reddit_arctic.fetch_post_comments("abc123") == []
+
+    def test_empty_post_id_returns_empty(self):
+        with mock.patch.object(reddit_arctic.http, "get") as g:
+            assert reddit_arctic.fetch_post_comments("") == []
+            assert reddit_arctic.fetch_post_comments(None) == []
+        g.assert_not_called()

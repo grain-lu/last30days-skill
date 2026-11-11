@@ -231,7 +231,7 @@ class TestSlotPriority:
         ]
         enriched_urls = []
 
-        def _capture(url):
+        def _capture(url, **_kwargs):
             enriched_urls.append(url)
             return {"top_comments": [], "comment_insights": [], "num_comments": None}
 
@@ -374,7 +374,7 @@ class TestSlotPriority:
         ]
         enriched_urls = []
 
-        def _capture(url):
+        def _capture(url, **_kwargs):
             enriched_urls.append(url)
             return {"top_comments": [], "comment_insights": [], "num_comments": None}
 
@@ -403,7 +403,7 @@ class TestSlotPriority:
         ]
         enriched_urls = []
 
-        def _capture(url):
+        def _capture(url, **_kwargs):
             enriched_urls.append(url)
             return {"top_comments": [], "comment_insights": [], "num_comments": None}
 
@@ -432,7 +432,10 @@ class TestScoredListingsFallback:
                                return_value=[arctic_post]) as arctic:
             out = reddit_keyless._scored_listings(["tea"], depth="quick", query="matcha")
         assert out == [arctic_post]
-        arctic.assert_called_once_with(["tea"], depth="quick", query="matcha", sorts=None)
+        arctic.assert_called_once_with(
+            ["tea"], depth="quick", query="matcha", sorts=None,
+            from_date=None, to_date=None,
+        )
 
     def test_shreddit_and_arctic_both_called_deduped(self):
         """Shreddit and arctic are both called; arctic supplements missing posts."""
@@ -477,7 +480,8 @@ class TestScoredListingsFallback:
                 ["Kanye"], depth="default", query="Kanye", sorts=["top", "hot", "new"]
             )
         arctic.assert_called_once_with(
-            ["Kanye"], depth="default", query="Kanye", sorts=["top", "hot", "new"]
+            ["Kanye"], depth="default", query="Kanye", sorts=["top", "hot", "new"],
+            from_date=None, to_date=None,
         )
 
     def test_arctic_supplements_all_subreddits(self):
@@ -509,3 +513,16 @@ class TestScoredListingsFallback:
         assert shreddit_post["url"] in urls
         assert arctic_post_tea["url"] in urls
         assert arctic_post_coffee["url"] in urls
+
+
+class TestEnrichDeadline:
+    def test_workers_share_the_enrichment_budget_deadline(self):
+        posts = [_post(1), _post(2)]
+        with mock.patch.object(reddit_keyless.time, "monotonic", return_value=1000.0), \
+             mock.patch.object(reddit_keyless.reddit_shreddit, "fetch_comments",
+                               return_value={"top_comments": [], "comment_insights": [],
+                                             "num_comments": None}) as fetch:
+            reddit_keyless._enrich(posts, "quick")
+        assert fetch.call_count == 2
+        assert {c.kwargs["deadline"] for c in fetch.call_args_list} == {
+            1000.0 + reddit_keyless.ENRICH_BUDGET}

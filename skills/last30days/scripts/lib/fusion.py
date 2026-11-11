@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from . import schema
+from . import entity_extract, schema
 
 # Standard RRF smoothing constant (Cormack et al. 2009)
 RRF_K = 60
@@ -134,6 +135,64 @@ _DIVERSITY_RELEVANCE_THRESHOLD = 0.25
 # otherwise lose its slot to a one-upvote post with better title overlap.
 _REDDIT_RESERVE_BY_POOL = ((15, 2), (40, 3))
 _REDDIT_RESERVE_MAX = 4
+
+
+# Capability reservation: on an enablement plan ("X control my computer"),
+# pool slots held for the best results of the searches for the capability
+# alone ("computer use MCP server"). Posts naming the host match several
+# searches and outrank them on RRF, so the tools that answer the question
+# would otherwise never reach the reranker.
+_CAPABILITY_RESERVE = 6
+_CAPABILITY_RESERVE_PER_SOURCE = 3
+ENABLEMENT_HOST_NOTE = "enablement-host:"  # planner.ENABLEMENT_HOST_NOTE
+
+
+def enablement_host(plan: schema.QueryPlan) -> str:
+    """The host an enablement plan names ("grok"), or "" for any other plan."""
+    for note in plan.notes:
+        if note.startswith(ENABLEMENT_HOST_NOTE):
+            return note[len(ENABLEMENT_HOST_NOTE):]
+    return ""
+
+
+def _names(text: str, host: str) -> bool:
+    return bool(re.search(rf"\b{re.escape(host)}", text, re.IGNORECASE))
+
+
+def capability_labels(plan: schema.QueryPlan) -> set[str]:
+    """Labels of an enablement plan's subqueries that leave out the host."""
+    host = enablement_host(plan)
+    if not host:
+        return set()
+    return {subquery.label for subquery in plan.subqueries if not _names(subquery.search_query, host)}
+
+
+def is_capability_result(candidate: schema.Candidate, labels: set[str], host: str) -> bool:
+    """A result of a capability-only search that does not itself name the host.
+
+    Some sources search the raw topic whatever the subquery says, so a
+    capability label alone also tags posts about the host; those need no help.
+    """
+    if not labels.intersection(candidate.subquery_labels):
+        return False
+    return not _names(f"{candidate.title} {candidate.snippet}", host)
+
+
+def _capability_reservation(results: list[schema.Candidate]) -> list[schema.Candidate]:
+    """Up to _CAPABILITY_RESERVE results, taken round-robin across sources.
+
+    Tool pages (Web, GitHub) rank below social posts on fused rank, so a plain
+    top-N went entirely to Reddit and TikTok posts about the capability.
+    """
+    by_source: dict[str, list[schema.Candidate]] = {}
+    for candidate in results:
+        by_source.setdefault(candidate.source, []).append(candidate)
+    chosen: list[schema.Candidate] = []
+    for rank in range(_CAPABILITY_RESERVE_PER_SOURCE):
+        for queue in by_source.values():
+            if rank < len(queue) and len(chosen) < _CAPABILITY_RESERVE:
+                chosen.append(queue[rank])
+    return chosen
 
 
 def _reddit_reserve_for(pool_limit: int) -> int:
@@ -290,6 +349,8 @@ def _diversify_pool(
     pool_limit: int,
     min_per_source: int = 2,
     entity: str = "",
+    capability: set[str] | None = None,
+    host: str = "",
 ) -> list[schema.Candidate]:
     """Ensure at least *min_per_source* items per qualifying source survive truncation.
 
@@ -305,6 +366,17 @@ def _diversify_pool(
             max_relevance[c.source] = c.local_relevance
 
     protected = _reddit_engagement_reservation(fused, _reddit_reserve_for(pool_limit), entity)
+    if capability:
+        reserved_ids = {c.candidate_id for c in protected}
+        protected += _capability_reservation(
+            [
+                c
+                for c in fused
+                if c.candidate_id not in reserved_ids
+                and not schema.candidate_out_of_window(c)
+                and is_capability_result(c, capability, host)
+            ]
+        )
     protected_ids = {c.candidate_id for c in protected}
     pool: list[schema.Candidate] = list(protected)
     seen = set(protected_ids)
@@ -373,6 +445,7 @@ def weighted_rrf(
     range_from: str | None = None,
     range_to: str | None = None,
     first_party_handles: Iterable[str] | None = None,
+    primary_handle: str | None = None,
 ) -> list[schema.Candidate]:
     """Fuse ranked lists into a single candidate pool.
 
@@ -395,6 +468,10 @@ def weighted_rrf(
         subquery = subqueries[label]
         weight = subquery.weight * plan.source_weights.get(source, 1.0)
         for rank, item in enumerate(items, start=1):
+            # Reject only the unqualified copy before combining its text,
+            # provenance, or votes with qualified evidence at the same URL.
+            if not entity_extract.matches_person_identity(item, plan.person_identity_anchors, primary_handle):
+                continue
             key = candidate_key(item)
             score = weight / (RRF_K + rank)
             item_local_relevance = item.local_relevance if item.local_relevance is not None else float(item.metadata.get("local_relevance", item.relevance_hint))
@@ -490,4 +567,6 @@ def weighted_rrf(
     from . import rerank
 
     entity = rerank._primary_entity(plan.raw_topic or "") if plan.raw_topic else ""
-    return _diversify_pool(fused, pool_limit, entity=entity)
+    return _diversify_pool(
+        fused, pool_limit, entity=entity, capability=capability_labels(plan), host=enablement_host(plan)
+    )

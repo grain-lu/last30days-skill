@@ -98,11 +98,39 @@ def _isolated_config(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _unthrottled_reddit_keyless(monkeypatch):
+    """The real limiter is process-global, so tests inherited a drained bucket and slept.
+    Only burst changes (rate stays real for wait-allowance math); throttle tests install their own."""
+    from lib import http
+
+    monkeypatch.setattr(
+        http,
+        "REDDIT_KEYLESS_LIMITER",
+        http.RateLimiter(rate_per_sec=http.DEFAULT_REDDIT_KEYLESS_RATE, burst=10_000),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_arctic_network():
     """Default Arctic transport collaborators to no-ops outside adapter tests."""
     with mock.patch("lib.reddit_arctic.fetch_scores", return_value={}), \
-         mock.patch("lib.reddit_arctic.fetch_listings", return_value=[]):
+         mock.patch("lib.reddit_arctic.fetch_listings", return_value=[]), \
+         mock.patch("lib.reddit_arctic.fetch_post_comments", return_value=[]):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_company_lookup_network(monkeypatch):
+    """The company lookup needs no key and runs for every company-shaped topic,
+    so any in-process engine run would reach Wikidata. Default its HTTP seam to
+    "no match"; the resolver's own tests replace ``get`` on the same seam."""
+    from types import SimpleNamespace
+
+    from lib import company_resolve
+
+    monkeypatch.setattr(
+        company_resolve, "http", SimpleNamespace(get=lambda *_args, **_kwargs: {"search": []}),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -118,6 +146,18 @@ def _no_ambient_grok_cli():
     # _is_available_uncached then both resolve absent on their own, leaving the
     # module's real control flow intact for tests that exercise it.
     with mock.patch("lib.grok_x.binary_path", return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _grok_audit_passes():
+    """Tests that fake the grok subprocess fake a build, not a binary on disk,
+    so the per-build tool-boundary audit cannot run against it. Default the
+    verdict to pass; tests/test_grok_audit.py and the boundary tests exercise
+    the real audit and verdict cache themselves."""
+    from lib import grok_audit
+
+    with mock.patch("lib.grok_audit.verdict_for", return_value=grok_audit.Verdict(grok_audit.PASS)):
         yield
 
 

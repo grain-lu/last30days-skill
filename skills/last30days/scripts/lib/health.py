@@ -42,6 +42,17 @@ UNREACHABLE = "unreachable"
 SCHEMA_DRIFT = "schema-drift"
 SKIPPED_UNCONFIGURED = "skipped-unconfigured"
 
+# Prefer the failure whose remediation matters most when several requests fail.
+FAILURE_SPECIFICITY = {
+    AUTH_FAILED: 0,
+    PAYMENT_REQUIRED: 1,
+    RATE_LIMITED: 2,
+    SCHEMA_DRIFT: 3,
+    TIMEOUT: 4,
+    UNREACHABLE: 5,
+    ERROR: 6,
+}
+
 
 def credits_exhausted_label(source: str) -> str:
     """Human label for a ``PAYMENT_REQUIRED`` outcome on ``source``.
@@ -146,7 +157,9 @@ _PP_CLI_SUFFIX = "-pp-cli"
 _PRINTING_PRESS_NPM = "@mvanhorn/printing-press-library@0.1.16"
 
 # Dependencies the doctor probes by default.
-KNOWN_DEPENDENCIES: Tuple[str, ...] = ("yt-dlp", "digg-pp-cli", "node", "ffmpeg", "grok")
+KNOWN_DEPENDENCIES: Tuple[str, ...] = (
+    "yt-dlp", "digg-pp-cli", "yahoo-finance-pp-cli", "node", "ffmpeg", "grok",
+)
 
 # Cheap side-effect-free version invocation per dependency (default --version).
 _VERSION_ARGS: Dict[str, List[str]] = {

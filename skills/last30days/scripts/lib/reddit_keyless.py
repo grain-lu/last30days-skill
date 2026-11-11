@@ -21,6 +21,7 @@ ScrapeCreators backup when every keyless lane comes up empty.
 import concurrent.futures
 import math
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +71,8 @@ def _scored_listings(
     depth: str = "default",
     query: str = "",
     sorts: Optional[List[str]] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Scored subreddit listings: shreddit partials, arctic-shift supplement.
 
@@ -91,7 +94,8 @@ def _scored_listings(
     if subreddits:
         try:
             arctic_posts = reddit_arctic.fetch_listings(
-                subreddits, depth=depth, query=query, sorts=sorts
+                subreddits, depth=depth, query=query, sorts=sorts,
+                from_date=from_date, to_date=to_date,
             )
         except Exception as exc:  # the fallback must never break the pipeline
             _log(f"arctic-shift listing supplement failed: {exc}")
@@ -124,7 +128,8 @@ def _discover(
     dedicated_posts: List[Dict[str, Any]] = []
     if dedicated_subreddits:
         dedicated_posts = _scored_listings(
-            dedicated_subreddits, depth=depth, query=topic, sorts=DEDICATED_SORTS
+            dedicated_subreddits, depth=depth, query=topic, sorts=DEDICATED_SORTS,
+            from_date=from_date, to_date=to_date,
         )
         for p in dedicated_posts:
             p["dedicated"] = True
@@ -141,7 +146,11 @@ def _discover(
     # are on-topic; include them as scored discovery. A bare run fetches no
     # listings, so high-upvote off-topic posts cannot flood the results.
     listing_posts = (
-        _scored_listings(subreddits, depth=depth, query=topic) if subreddits else []
+        _scored_listings(
+            subreddits, depth=depth, query=topic, from_date=from_date, to_date=to_date
+        )
+        if subreddits
+        else []
     )
     _log(
         f"Tier 1 (site search) {len(search_posts)} posts; "
@@ -195,10 +204,10 @@ def _discover(
     return merged
 
 
-def _enrich_one(post: Dict[str, Any]) -> Dict[str, Any]:
+def _enrich_one(post: Dict[str, Any], deadline: Optional[float] = None) -> Dict[str, Any]:
     """Attach shreddit comments + real comment count. Never raises."""
     try:
-        data = reddit_shreddit.fetch_comments(post.get("url", ""))
+        data = reddit_shreddit.fetch_comments(post.get("url", ""), deadline=deadline)
         if data.get("top_comments"):
             post["top_comments"] = data["top_comments"]
         if data.get("comment_insights"):
@@ -221,10 +230,13 @@ def _enrich(posts: List[Dict[str, Any]], depth: str) -> List[Dict[str, Any]]:
         return posts
 
     result_map: Dict[int, Dict[str, Any]] = {}
+    # Leaving the executor joins running workers, so the archive fallback
+    # must stop by the same budget the wait below enforces.
+    deadline = time.monotonic() + ENRICH_BUDGET
     try:
         with ThreadPoolExecutor(max_workers=min(limit, MAX_ENRICH_WORKERS)) as executor:
             futures = {
-                http.submit_with_context(executor, _enrich_one, post): i
+                http.submit_with_context(executor, _enrich_one, post, deadline): i
                 for i, post in enumerate(to_enrich)
             }
             # The budget covers the fetches; the allowance covers the shared

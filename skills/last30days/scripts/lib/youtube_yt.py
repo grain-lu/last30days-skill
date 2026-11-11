@@ -6,6 +6,8 @@ transcript extraction. No API keys needed — just have yt-dlp installed.
 Inspired by Peter Steinberger's toolchain approach (yt-dlp + summarize CLI).
 """
 
+import contextlib
+import contextvars
 import copy
 import json
 import math
@@ -18,10 +20,14 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import datetime as _dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 # Depth configurations: how many videos to search / transcribe
 DEPTH_CONFIG = {
@@ -58,7 +64,7 @@ def reset_transcript_fetch_stats() -> None:
 # Max words to keep from each transcript
 TRANSCRIPT_MAX_WORDS = 5000
 
-from . import dates, health, http, log, subproc
+from . import bounded_get, dates, health, http, log, subproc
 from .query import infer_query_intent
 
 from .relevance import token_overlap_relevance as _compute_relevance
@@ -162,6 +168,190 @@ def _log(msg: str):
     log.source_log("YouTube", msg, tty_only=False)
 
 
+# The research run's stop state, set by the pipeline for the YouTube lane:
+# ``stopped()`` is True once the run is over (deadline passed or cancelled),
+# and ``cancel``/``deadline`` bound each paid request and its retries to the
+# same moment. An abandoned lane keeps running after the report is saved, and
+# every ScrapeCreators call it made then was a paid result nobody would read
+# (#1315). Pool workers inherit it through http.submit_with_context.
+@dataclass(frozen=True)
+class _SCSpendLimit:
+    stopped: Callable[[], bool]
+    cancel: Optional[threading.Event] = None
+    deadline: Optional[float] = None
+    return_deadline: Optional[float] = None
+
+
+_sc_spend_limit: contextvars.ContextVar[Optional[_SCSpendLimit]] = (
+    contextvars.ContextVar("youtube_sc_spend_limit", default=None)
+)
+
+
+@contextlib.contextmanager
+def sc_spend_until(
+    stopped: Callable[[], bool],
+    *,
+    cancel: Optional[threading.Event] = None,
+    deadline: Optional[float] = None,
+    return_deadline: Optional[float] = None,
+) -> Iterator[None]:
+    """Refuse ScrapeCreators YouTube calls in this context once ``stopped()``.
+
+    ``cancel`` and ``deadline`` (monotonic) also cut off a request, or its
+    retries, that is still running when the run ends. A lane can supply an
+    earlier ``return_deadline`` to preserve time for handing back its results.
+    """
+    token = _sc_spend_limit.set(_SCSpendLimit(stopped, cancel, deadline, return_deadline))
+    try:
+        yield
+    finally:
+        _sc_spend_limit.reset(token)
+
+
+# The pipeline discards a lane that is still running at its deadline, so the
+# lane must hand back what it found this long before that moment.
+_LANE_RETURN_MARGIN_SECONDS = 10.0
+
+
+def _lane_deadline() -> Optional[float]:
+    limit = _sc_spend_limit.get()
+    if limit is None:
+        return None
+    deadline = limit.return_deadline
+    if deadline is None:
+        if limit.deadline is None:
+            return None
+        deadline = limit.deadline - _LANE_RETURN_MARGIN_SECONDS
+    return deadline
+
+
+def _lane_seconds_left() -> Optional[float]:
+    """Seconds until this lane must return its results, or None if unbounded."""
+    deadline = _lane_deadline()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _lane_out_of_time() -> bool:
+    seconds_left = _lane_seconds_left()
+    return seconds_left is not None and seconds_left <= 0
+
+
+# Another expanded search has to leave this long for transcripts. A default
+# run targets 2 (60s); a deep run targets 8 (75s). In between, scale linearly.
+_TRANSCRIPT_RESERVE_FLOOR_SECONDS = 60.0
+_TRANSCRIPT_RESERVE_CEILING_SECONDS = 75.0
+_TRANSCRIPT_RESERVE_FLOOR_TARGET = 2
+_TRANSCRIPT_RESERVE_CEILING_TARGET = 8
+
+
+def _transcript_search_reserve(transcript_limit: int) -> float:
+    """Seconds to keep for transcripts before starting another expanded search."""
+    if transcript_limit <= 0:
+        return 0.0
+    span = (transcript_limit - _TRANSCRIPT_RESERVE_FLOOR_TARGET) / (
+        _TRANSCRIPT_RESERVE_CEILING_TARGET - _TRANSCRIPT_RESERVE_FLOOR_TARGET
+    )
+    span = min(1.0, max(0.0, span))
+    return _TRANSCRIPT_RESERVE_FLOOR_SECONDS + (
+        _TRANSCRIPT_RESERVE_CEILING_SECONDS - _TRANSCRIPT_RESERVE_FLOOR_SECONDS
+    ) * span
+
+
+def _lane_under_transcript_reserve(reserve: float) -> bool:
+    """True when another search would spend the time kept for transcripts."""
+    seconds_left = _lane_seconds_left()
+    return reserve > 0 and seconds_left is not None and seconds_left < reserve
+
+
+# yt-dlp text for "stop calling YouTube for transcripts this search".
+# Timeouts are not included: one slow video is not a block.
+_YOUTUBE_BLOCK_RE = re.compile(
+    r"429|too many requests|sign in to confirm(?! your age)|not a bot|bot-gate",
+    re.IGNORECASE,
+)
+
+
+def _is_youtube_bot_or_rate_limit(detail: str) -> bool:
+    return bool(detail) and _YOUTUBE_BLOCK_RE.search(detail) is not None
+
+
+class _YouTubeBlock:
+    """Shared 'yt-dlp is blocked' flag for one search and its transcript workers."""
+
+    def __init__(self) -> None:
+        self.tripped = False
+        self._lock = threading.Lock()
+
+    def note(self, detail: str) -> None:
+        if not _is_youtube_bot_or_rate_limit(detail):
+            return
+        with self._lock:
+            self.tripped = True
+
+
+_youtube_block: contextvars.ContextVar[Optional["_YouTubeBlock"]] = (
+    contextvars.ContextVar("youtube_ytdlp_block", default=None)
+)
+
+
+@contextlib.contextmanager
+def _youtube_block_scope() -> Iterator["_YouTubeBlock"]:
+    """Reuse a parent flag, or own one for this call and the workers it submits."""
+    current = _youtube_block.get()
+    if current is not None:
+        yield current
+        return
+    block = _YouTubeBlock()
+    token = _youtube_block.set(block)
+    try:
+        yield block
+    finally:
+        _youtube_block.reset(token)
+
+
+def _note_youtube_block(detail: str) -> None:
+    block = _youtube_block.get()
+    if block is not None:
+        block.note(detail)
+
+
+def _youtube_transcripts_blocked() -> bool:
+    block = _youtube_block.get()
+    return block is not None and block.tripped
+
+
+def _sc_spend_blocked(what: str) -> bool:
+    """True when research stopped or the lane must return before buying ``what``."""
+    limit = _sc_spend_limit.get()
+    if limit is None:
+        return False
+    lane_expired = limit.return_deadline is not None and time.monotonic() >= limit.return_deadline
+    if not limit.stopped() and not lane_expired:
+        return False
+    _log(f"Skipping ScrapeCreators {what}: the research stopped or the lane deadline passed")
+    return True
+
+
+def _sc_request_bounds(deadline: Optional[float] = None) -> Dict[str, Any]:
+    """``http.get`` kwargs that stop a paid request when the research run ends.
+
+    ``deadline`` is the caller's own monotonic deadline, if any; the earlier
+    of it, the run's deadline, and the lane's return deadline wins.
+    """
+    limit = _sc_spend_limit.get()
+    bounds: Dict[str, Any] = {}
+    deadlines = [d for d in (
+        deadline,
+        limit.deadline if limit else None,
+        limit.return_deadline if limit else None,
+    ) if d is not None]
+    if deadlines:
+        bounds["deadline_monotonic"] = min(deadlines)
+    if limit is not None and limit.cancel is not None:
+        bounds["cancel"] = limit.cancel
+    return bounds
+
+
 def reset_search_cache() -> None:
     """Clear the in-run ytsearch cache.
 
@@ -191,10 +381,63 @@ def _search_timeout() -> float:
     return _env_positive_float("LAST30DAYS_YT_SEARCH_TIMEOUT", float(_SEARCH_TIMEOUT))
 
 
-def _run_ytdlp(cmd: List[str], *, timeout: float) -> subproc.SubprocResult:
-    """Run a yt-dlp (or SSH-wrapped) command under the process-wide concurrency gate."""
-    with _ytdlp_slots:
-        return subproc.run_with_timeout(cmd, timeout=timeout)
+class _YtdlpBlocked(Exception):
+    """A keyed transcript got a free slot only after YouTube was already blocked."""
+
+
+def _remember_youtube_block(result: subproc.SubprocResult) -> subproc.SubprocResult:
+    """Record a bot-check or 429 before this worker gives up its yt-dlp slot.
+
+    The next worker rechecks the flag after acquire. The slot has to still be
+    held here, or that worker starts yt-dlp before this one records the block.
+    """
+    if result.returncode != 0:
+        _note_youtube_block(result.stderr or "")
+    return result
+
+
+def _run_ytdlp(
+    cmd: List[str],
+    *,
+    timeout: float,
+    abort_if_blocked: bool = False,
+) -> subproc.SubprocResult:
+    """Run a yt-dlp (or SSH-wrapped) command under the process-wide concurrency gate.
+
+    The wait for a slot and the run itself both end when the lane must return.
+    A keyed transcript checks the bot-check flag again after the wait. It may
+    have been clear when the worker queued and set while the worker was waiting.
+    """
+    def _abort_if_blocked() -> None:
+        if abort_if_blocked and _youtube_transcripts_blocked():
+            raise _YtdlpBlocked()
+
+    seconds_left = _lane_seconds_left()
+    if seconds_left is None:
+        with _ytdlp_slots:
+            _abort_if_blocked()
+            return _remember_youtube_block(subproc.run_with_timeout(cmd, timeout=timeout))
+    if not _ytdlp_slots.acquire(timeout=max(0.0, seconds_left)):
+        raise subproc.SubprocTimeout("no yt-dlp slot before the lane deadline", started=False)
+    try:
+        _abort_if_blocked()
+        seconds_left = _lane_seconds_left() or 0.0
+        if seconds_left <= 0:
+            raise subproc.SubprocTimeout("lane deadline passed", started=False)
+        bounded = min(timeout, seconds_left)
+        try:
+            result = subproc.run_with_timeout(cmd, timeout=bounded)
+        except subproc.SubprocTimeout as exc:
+            # The attempt cap was not what stopped the process. The lane
+            # deadline was shorter, so don't report the full cap.
+            if bounded < timeout:
+                raise subproc.SubprocTimeout(
+                    "lane deadline reached", started=exc.started,
+                ) from exc
+            raise
+        return _remember_youtube_block(result)
+    finally:
+        _ytdlp_slots.release()
 
 
 def _claim_search_slot(
@@ -452,7 +695,18 @@ def _extract_core_subject(topic: str) -> str:
     return extract_core_subject(topic, noise=VIRAL_NOISE | _YT_EXTRA)
 
 
-def expand_youtube_queries(topic: str, depth: str) -> List[str]:
+def comparison_share(total: int, entity_count: int) -> int:
+    """One comparison entity's share of a single-topic yt-dlp budget (#1335).
+
+    Every entity's yt-dlp work queues on the same ``_YTDLP_MAX_CONCURRENT``
+    slots, so N full budgets overran the stream wait; each keeps at least one.
+    """
+    if total <= 0 or entity_count <= 1:
+        return total
+    return max(1, -(-total // entity_count))
+
+
+def expand_youtube_queries(topic: str, depth: str, entity_count: int = 1) -> List[str]:
     """Generate multiple YouTube search queries from a topic.
 
     Mirrors reddit.py's expand_reddit_queries() pattern:
@@ -492,7 +746,7 @@ def expand_youtube_queries(topic: str, depth: str) -> List[str]:
 
     # Cap by depth budget
     caps = {"quick": 1, "default": 2, "deep": 3}
-    cap = caps.get(depth, 2)
+    cap = comparison_share(caps.get(depth, 2), entity_count)
     return queries[:cap]
 
 
@@ -528,6 +782,123 @@ def _apply_date_window(
         return recent
     _log(f"Found {len(items)} videos ({len(recent)} within date range, keeping all)")
     return items
+
+
+# YouTube's own upload-date search filters (the ``sp`` results-page parameter),
+# smallest first: this week, this month, this year.
+_UPLOAD_DATE_FILTERS = ((7, "EgIIAw=="), (31, "EgIIBA=="), (366, "EgIIBQ=="))
+# The filters count back from now, so they only fit a window ending about today.
+_UPLOAD_FILTER_MAX_END_LAG_DAYS = 2
+
+
+def _upload_date_filter(from_date: str, to_date: str) -> Optional[str]:
+    """Return the smallest YouTube upload filter covering the window, or None."""
+    try:
+        start = _dt.date.fromisoformat(from_date)
+        end = _dt.date.fromisoformat(to_date)
+    except ValueError:
+        return None
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    if (today - end).days > _UPLOAD_FILTER_MAX_END_LAG_DAYS:
+        return None
+    span = (today - start).days
+    for max_days, sp in _UPLOAD_DATE_FILTERS:
+        if span <= max_days:
+            return sp
+    return None
+
+
+def _first_stderr_line(stderr: Optional[str]) -> str:
+    lines = (stderr or "").strip().splitlines()
+    return lines[0] if lines else "(no stderr)"
+
+
+def _count_in_window(items: List[Dict[str, Any]], from_date: str, to_date: str) -> int:
+    return sum(1 for i in items if i["date"] and from_date <= i["date"] <= to_date)
+
+
+def _parse_search_stdout(stdout: str, core_topic: str) -> List[Dict[str, Any]]:
+    """Parse yt-dlp ``--dump-json`` lines into video items."""
+    items = []
+    for line in stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            video = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        video_id = video.get("id", "")
+        view_count = video.get("view_count") if video.get("view_count") is not None else 0
+        like_count = video.get("like_count") if video.get("like_count") is not None else 0
+        comment_count = video.get("comment_count") if video.get("comment_count") is not None else 0
+        upload_date = video.get("upload_date", "")  # YYYYMMDD
+
+        # Convert YYYYMMDD to YYYY-MM-DD
+        date_str = None
+        if upload_date and len(upload_date) == 8:
+            date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+
+        description = str(video.get("description", ""))[:500]
+        items.append({
+            "video_id": video_id,
+            "title": video.get("title", ""),
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "channel_name": video.get("channel", video.get("uploader", "")),
+            "date": date_str,
+            "engagement": {
+                "views": view_count,
+                "likes": like_count,
+                "comments": comment_count,
+            },
+            "duration": video.get("duration"),
+            "relevance": _compute_relevance(core_topic, f"{video.get('title', '')} {description}"),
+            "why_relevant": f"YouTube: {video.get('title', core_topic)[:60]}",
+            "description": description,
+        })
+    return items
+
+
+def _search_recent_uploads(
+    core_topic: str, count: int, sp: str, timeout: float,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Search YouTube's results page with an upload-date filter.
+
+    Relevance-ranked ``ytsearch`` fills its top results with years-old videos
+    for topics that have a big back catalog (a music artist's official videos),
+    so a recent window can come back empty while new uploads exist. The
+    filtered results page returns only uploads from the period.
+
+    Returns the parsed videos and an error string when the search failed
+    without producing any, so the caller can keep the failure visible.
+    """
+    query = urllib.parse.urlencode({"search_query": core_topic, "sp": sp})
+    cmd = [
+        "yt-dlp",
+        "--ignore-config",
+        "--no-cookies-from-browser",
+        f"https://www.youtube.com/results?{query}",
+        "--playlist-end",
+        str(count),
+        "--dump-json",
+        "--no-warnings",
+        "--no-download",
+    ]
+    try:
+        result = _run_ytdlp(_wrap_ytdlp_cmd(cmd), timeout=timeout)
+    except subproc.SubprocTimeout:
+        _log(f"YouTube upload-date search timed out ({timeout:g}s)")
+        return [], f"Upload-date search timed out after {timeout:g}s"
+    except FileNotFoundError:
+        return [], "yt-dlp not found"
+    if result.returncode != 0:
+        _note_youtube_block(result.stderr or "")
+    items = _parse_search_stdout(result.stdout or "", core_topic)
+    _log(f"YouTube upload-date search found {len(items)} videos")
+    if result.returncode != 0 and not items:
+        return [], f"yt-dlp upload-date search failed: {_first_stderr_line(result.stderr)}"
+    return items, None
 
 
 def search_youtube(
@@ -603,64 +974,51 @@ def search_youtube(
             return published
 
         stdout = result.stdout
+        # A bot-check can land after yt-dlp has already printed some videos.
+        # Keep those videos. Still record the block so later transcripts in
+        # this search do not start another yt-dlp call. An empty stdout keeps
+        # going through the error path below.
+        if result.returncode != 0:
+            _note_youtube_block(result.stderr or "")
+        stderr = result.stderr or ""
+        blocked = result.returncode != 0 and _is_youtube_bot_or_rate_limit(stderr)
+        search_error: Optional[str] = None
         if result.returncode != 0 and not stdout.strip():
-            stderr_first = (result.stderr or "").strip().splitlines()
-            first_line = stderr_first[0] if stderr_first else "(no stderr)"
+            first_line = _first_stderr_line(stderr)
             if ssh_host:
                 _log(
                     f"YouTube search via SSH host {ssh_host!r} failed "
                     f"(rc={result.returncode}): {first_line}"
                 )
-                error = f"SSH routing to {ssh_host!r} failed: {first_line}"
+                search_error = f"SSH routing to {ssh_host!r} failed: {first_line}"
             else:
                 _log(f"YouTube search failed (rc={result.returncode}): {first_line}")
-                error = f"yt-dlp search failed: {first_line}"
-            published = _publish({"items": [], "error": error})
-            return published
-        if not stdout.strip():
+                search_error = f"yt-dlp search failed: {first_line}"
+
+        items = _parse_search_stdout(stdout, core_topic) if stdout.strip() else []
+
+        # Old catalog videos can crowd every relevance slot, and an age-gated
+        # result can leave stdout empty. For a recent window, retry once with
+        # YouTube's upload-date filter and merge. A bot block skips it.
+        retry_error: Optional[str] = None
+        sp = None
+        if (
+            freshness_mode in _RECENT_FRESHNESS_MODES
+            and _count_in_window(items, from_date, to_date) < 3
+            and not blocked
+            and not _lane_out_of_time()
+        ):
+            sp = _upload_date_filter(from_date, to_date)
+        if sp:
+            _log(f"Retrying YouTube for '{core_topic}' with an upload-date filter")
+            recent_items, retry_error = _search_recent_uploads(core_topic, count, sp, timeout)
+            seen = {i["video_id"] for i in items}
+            for item in recent_items:
+                if item["video_id"] not in seen:
+                    seen.add(item["video_id"])
+                    items.append(item)
+        if not items and not search_error and not retry_error:
             _log("YouTube search returned 0 results")
-            published = _publish({"items": []})
-            return published
-
-        # Parse JSON-per-line output
-        items = []
-        for line in stdout.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                video = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            video_id = video.get("id", "")
-            view_count = video.get("view_count") if video.get("view_count") is not None else 0
-            like_count = video.get("like_count") if video.get("like_count") is not None else 0
-            comment_count = video.get("comment_count") if video.get("comment_count") is not None else 0
-            upload_date = video.get("upload_date", "")  # YYYYMMDD
-
-            # Convert YYYYMMDD to YYYY-MM-DD
-            date_str = None
-            if upload_date and len(upload_date) == 8:
-                date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
-
-            description = str(video.get("description", ""))[:500]
-            items.append({
-                "video_id": video_id,
-                "title": video.get("title", ""),
-                "url": f"https://www.youtube.com/watch?v={video_id}",
-                "channel_name": video.get("channel", video.get("uploader", "")),
-                "date": date_str,
-                "engagement": {
-                    "views": view_count,
-                    "likes": like_count,
-                    "comments": comment_count,
-                },
-                "duration": video.get("duration"),
-                "relevance": _compute_relevance(core_topic, f"{video.get('title', '')} {description}"),
-                "why_relevant": f"YouTube: {video.get('title', core_topic)[:60]}",
-                "description": description,
-            })
 
         # Date filter: prefer recent items; the keep-all fallback is scoped
         # by freshness mode (evergreen only), see _apply_date_window.
@@ -668,7 +1026,12 @@ def search_youtube(
 
         # Sort by views descending
         items.sort(key=lambda x: x["engagement"]["views"], reverse=True)
-        published = _publish({"items": items})
+        payload: Dict[str, Any] = {"items": items}
+        # Nothing usable survived: keep whichever search failed visible so the
+        # run reports a failed source instead of a quiet zero.
+        if not items and (search_error or retry_error):
+            payload["error"] = search_error or retry_error
+        published = _publish(payload)
         return published
     except Exception as exc:
         # Post-subprocess failures (parse/relevance/sort) must still unblock
@@ -705,6 +1068,23 @@ def _clean_vtt(vtt_text: str) -> str:
 _YT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
+def _read_transcript_url(req: urllib.request.Request, timeout: float) -> str:
+    deadline = _lane_deadline()
+    if deadline is None:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    if deadline <= time.monotonic():
+        raise TimeoutError("YouTube lane deadline passed")
+    limit = _sc_spend_limit.get()
+    _, body, error = bounded_get.get(
+        req, timeout=timeout, deadline_monotonic=deadline,
+        cancel=limit.cancel if limit else None, read_error_body=False,
+    )
+    if error is not None:
+        raise error
+    return (body or b"").decode("utf-8", errors="replace")
+
+
 def _fetch_transcript_direct(
     video_id: str,
     timeout: int = 30,
@@ -734,8 +1114,7 @@ def _fetch_transcript_direct(
     # Step 1: Fetch the watch page HTML
     req = urllib.request.Request(watch_url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        html = _read_transcript_url(req, timeout)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
         _log(f"Direct transcript: failed to fetch watch page for {video_id}: {exc}")
         return None
@@ -798,8 +1177,7 @@ def _fetch_transcript_direct(
     vtt_url = f"{base_url}{sep}fmt=vtt"
     vtt_req = urllib.request.Request(vtt_url, headers=headers)
     try:
-        with urllib.request.urlopen(vtt_req, timeout=timeout) as resp:
-            vtt_text = resp.read().decode("utf-8", errors="replace")
+        vtt_text = _read_transcript_url(vtt_req, timeout)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
         _log(f"Direct transcript: failed to fetch VTT for {video_id}: {exc}")
         return None
@@ -810,13 +1188,18 @@ def _fetch_transcript_direct(
     return vtt_text
 
 
-def _fetch_transcript_ytdlp_via_ssh(video_id: str, ssh_host: str) -> Optional[str]:
+def _fetch_transcript_ytdlp_via_ssh(
+    video_id: str,
+    ssh_host: str,
+    *,
+    abort_if_blocked: bool = False,
+) -> Optional[str]:
     """Fetch transcript via yt-dlp on a remote SSH host (mktemp + cat pipeline)."""
     if not _SSH_HOST_ALIAS_RE.match(ssh_host):
         return None
     url = f"https://www.youtube.com/watch?v={video_id}"
     quoted_url = shlex.quote(url)
-    sub_langs = shlex.quote(_ytdlp_sub_langs())
+    sub_langs = shlex.quote(_ytdlp_request_langs())
     client = _ytdlp_player_client()
     extractor = (
         f"--extractor-args {shlex.quote(f'youtube:player_client={client}')} "
@@ -828,19 +1211,20 @@ def _fetch_transcript_ytdlp_via_ssh(video_id: str, ssh_host: str) -> Optional[st
     remote_script = (
         "set -e; "
         "TMPD=$(mktemp -d); "
+        "YTDLP_RC=0; "
         "yt-dlp --ignore-config --no-cookies-from-browser "
         f"{extractor}"
         f"{proxy_flag}"
-        f"--write-auto-subs --sub-lang {sub_langs} --sub-format vtt "
+        f"--write-subs --write-auto-subs --sub-lang {sub_langs} --sub-format vtt "
         "--skip-download --no-warnings "
-        f'-o "$TMPD/%(id)s" {quoted_url} >/dev/null 2>&1 || true; '
+        f'-o "$TMPD/%(id)s" {quoted_url} >/dev/null || YTDLP_RC=$?; '
         'VTT=$(find "$TMPD" -maxdepth 1 -name "*.vtt" 2>/dev/null | head -1); '
         '[ -n "$VTT" ] && cat "$VTT"; '
-        'rm -rf "$TMPD"'
+        'rm -rf "$TMPD"; exit "$YTDLP_RC"'
     )
     cmd = ["ssh", "-o", "BatchMode=yes", "--", ssh_host, remote_script]
     try:
-        result = _run_ytdlp(cmd, timeout=45)
+        result = _run_ytdlp(cmd, timeout=45, abort_if_blocked=abort_if_blocked)
     except subproc.SubprocTimeout:
         _log(f"SSH yt-dlp transcript timed out for {video_id} via {ssh_host!r}")
         return None
@@ -867,6 +1251,25 @@ def _ytdlp_sub_langs() -> str:
     return ",".join(code.strip().lower() for code in raw.split(",") if code.strip()) or "en,es,pt"
 
 
+def _ytdlp_request_langs() -> str:
+    """The ``--sub-lang`` value: every configured ``<lang>-orig``, then the plain codes.
+
+    Auto-dubbed videos expose the original-speech auto track as
+    ``<lang>-orig``, and their plain ``<lang>`` tracks are translations that
+    can 429 every time while ``-orig`` downloads (#1314). yt-dlp downloads
+    languages in order and stops at the first error, so every ``-orig`` track
+    comes before any plain code: a Spanish video dubbed into English must
+    reach ``es-orig`` before the translated ``en`` can fail. The partial-VTT
+    salvage keeps the ``-orig`` file when a plain track then fails. yt-dlp
+    skips languages a video does not have, so non-dubbed videos are
+    unaffected. A code configured as ``-orig`` stays original-only.
+    """
+    codes = _ytdlp_sub_langs().split(",")
+    originals = [code if code.endswith("-orig") else f"{code}-orig" for code in codes]
+    plain = [code for code in codes if not code.endswith("-orig")]
+    return ",".join(dict.fromkeys(originals + plain))
+
+
 def _transcript_fast_timeout() -> float:
     """Return the keyed-run yt-dlp timeout, preserving the 12s default."""
     return _env_positive_float(
@@ -874,18 +1277,35 @@ def _transcript_fast_timeout() -> float:
         float(_TRANSCRIPT_FAST_TIMEOUT),
     )
 
+
+def _transcript_fast_attempts() -> int:
+    """Return keyed-run yt-dlp attempts before the SC rescue (default 1, #1316)."""
+    raw = os.environ.get("LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return value if value > 0 else 1
+
 def _pick_ytdlp_vtt(video_id: str, temp_dir: str, priority: List[str]) -> Optional[Path]:
     """Return the best on-disk VTT match for video_id, preferring priority order."""
     matches = list(Path(temp_dir).glob(f"{video_id}*.vtt"))
     if not matches:
         return None
-    priority_index = {code: i for i, code in enumerate(priority)}
+    # A configured "en-orig" ranks as "en": files are matched by base code.
+    priority_index: Dict[str, int] = {}
+    for code in priority:
+        priority_index.setdefault(code.removesuffix("-orig"), len(priority_index))
 
-    def rank(p: Path) -> int:
+    def rank(p: Path) -> Tuple[int, int]:
         stem = p.stem
         suffix = stem[len(video_id) + 1:] if stem.startswith(video_id + ".") else ""
         code = suffix.split("-")[0].split(".")[0]
-        return priority_index.get(code, len(priority_index))
+        # Within one language, a plain track that downloaded wins: it is the
+        # uploaded subtitle when one exists, and otherwise the same speech
+        # recognition as -orig. The -orig file is the fallback for when the
+        # plain track 429s (#1314).
+        return (priority_index.get(code, len(priority_index)), 1 if suffix.endswith("-orig") else 0)
 
     return sorted(matches, key=rank)[0]
 
@@ -931,7 +1351,8 @@ def _fetch_transcript_ytdlp(
         fast_fail: When True, a ScrapeCreators fallback is available, so a
             transient failure (429 / bot-gate) should fail over fast rather
             than retry into the same rate limit. Collapses to a single attempt
-            with a shorter per-attempt timeout. The slow thing in a run is
+            (``LAST30DAYS_YT_TRANSCRIPT_FAST_ATTEMPTS`` raises it) with a
+            shorter per-attempt timeout. The slow thing in a run is
             yt-dlp retrying, not the fast SC fetch, so this is what keeps
             "yt-dlp first" from reintroducing the multi-minute hang.
 
@@ -943,8 +1364,12 @@ def _fetch_transcript_ytdlp(
         "yt-dlp",
         "--ignore-config",
         "--no-cookies-from-browser",
+        # --write-subs: a video with uploaded subtitles and no auto track
+        # otherwise exits 0 with no file and falls through to paid SC (#1313).
+        # yt-dlp prefers the uploaded track when both exist for a language.
+        "--write-subs",
         "--write-auto-subs",
-        "--sub-lang", _ytdlp_sub_langs(),
+        "--sub-lang", _ytdlp_request_langs(),
         "--sub-format", "vtt",
         "--skip-download",
         "--no-warnings",
@@ -957,15 +1382,24 @@ def _fetch_transcript_ytdlp(
         cmd = list(cmd) + ["--proxy", proxy]
 
     timeout = _transcript_fast_timeout() if fast_fail else _TRANSCRIPT_TIMEOUT
-    attempts = 1 if fast_fail else _TRANSCRIPT_MAX_RETRIES + 1
+    attempts = _transcript_fast_attempts() if fast_fail else _TRANSCRIPT_MAX_RETRIES + 1
     last_reason: Optional[str] = None
     for attempt in range(attempts):
         try:
-            result = _run_ytdlp(cmd, timeout=timeout)
-        except subproc.SubprocTimeout:
-            last_reason = f"timed out after {timeout}s"
-            _log(f"yt-dlp transcript timed out after {timeout}s for {video_id} "
-                 f"(attempt {attempt + 1}/{attempts})")
+            result = _run_ytdlp(
+                cmd, timeout=timeout, abort_if_blocked=fast_fail,
+            )
+        except subproc.SubprocTimeout as exc:
+            if "lane deadline" in str(exc).lower():
+                last_reason = "lane deadline reached"
+                _log(
+                    f"yt-dlp transcript for {video_id} hit the lane deadline "
+                    f"(attempt {attempt + 1}/{attempts})"
+                )
+            else:
+                last_reason = f"timed out after {timeout}s"
+                _log(f"yt-dlp transcript timed out after {timeout}s for {video_id} "
+                     f"(attempt {attempt + 1}/{attempts})")
             # yt-dlp downloads requested languages sequentially. A timeout can
             # therefore leave a complete first-choice VTT on disk; keep it
             # instead of spending a ScrapeCreators fallback credit.
@@ -1038,11 +1472,44 @@ def _should_try_sc_transcript(status: Optional[Dict[str, Any]]) -> bool:
     return not st.get("no_caption_tracks")
 
 
+class _RescueBudget:
+    """Thread-safe cap on successful SC transcript rescues in one batch.
+
+    A call reserves a slot before it is made and settles it afterwards: a
+    transcript fills the slot, an empty result frees it. While every open slot
+    is held by a call still in flight, other workers wait for one to settle
+    instead of skipping their video, so a miss never leaves the target short.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = limit
+        self._filled = 0
+        self._pending = 0
+        self._cond = threading.Condition()
+
+    def reserve(self) -> bool:
+        with self._cond:
+            while self._filled < self._limit and self._filled + self._pending >= self._limit:
+                self._cond.wait()
+            if self._filled >= self._limit:
+                return False
+            self._pending += 1
+            return True
+
+    def settle(self, filled: bool) -> None:
+        with self._cond:
+            self._pending -= 1
+            if filled:
+                self._filled += 1
+            self._cond.notify_all()
+
+
 def fetch_transcript(
     video_id: str,
     temp_dir: str,
     status: Optional[Dict[str, Any]] = None,
     token: Optional[str] = None,
+    rescue_budget: Optional[_RescueBudget] = None,
 ) -> Optional[str]:
     """Fetch auto-generated transcript for a YouTube video.
 
@@ -1065,36 +1532,71 @@ def fetch_transcript(
             failure falls back to the SC transcript endpoint. A credit is only
             spent on a genuine yt-dlp failure, never on success and never on a
             video proven to have no captions. None preserves keyless behavior.
+        rescue_budget: Optional cap shared across a batch. A rescue reserves a
+            slot before the paid call and keeps it only when it returns a
+            transcript; once the cap is filled the video stays without one.
 
     Returns:
         Plaintext transcript string, or None if no captions available.
     """
     raw_vtt = None
+    skip_ytdlp = False
     ssh_host = _ytdlp_ssh_host()
     ta_key = _ta_key()
-    if ssh_host and is_ytdlp_installed():
-        raw_vtt = _fetch_transcript_ytdlp_via_ssh(video_id, ssh_host)
-        if not raw_vtt:
-            _log(f"SSH yt-dlp transcript failed for {video_id}, trying direct HTTP fallback")
-            raw_vtt = _fetch_transcript_direct(video_id, status=status)
-    elif is_ytdlp_installed():
-        raw_vtt = _fetch_transcript_ytdlp(
-            video_id, temp_dir, status=status,
-            fast_fail=bool(token or _ta_key()),
-        )
-        if not raw_vtt:
-            ytdlp_error = (status or {}).get("ytdlp_error")
-            if ytdlp_error:
-                # Hard failure (429 / bot-gate / timeout). The direct-HTTP
-                # fallback is also YouTube-blocked, so skip it and let the
-                # ScrapeCreators fallback below handle it when a key is present.
-                _log(f"Transcript fetch failed for {video_id}: {ytdlp_error}")
+    # A bot-check or 429 already happened in this search. More yt-dlp calls
+    # hit the same wall, so a keyed run goes straight to ScrapeCreators.
+    # With no key, every video still tries yt-dlp. Workers that queued for a
+    # slot before the flag flipped raise _YtdlpBlocked once the slot is free.
+    # (local: a TranscriptAPI key counts as "keyed" — a paid fallback exists.)
+    if (token or ta_key) and _youtube_transcripts_blocked():
+        skip_ytdlp = True
+    elif ssh_host and is_ytdlp_installed():
+        try:
+            if token or ta_key:
+                raw_vtt = _fetch_transcript_ytdlp_via_ssh(
+                    video_id, ssh_host, abort_if_blocked=True,
+                )
             else:
-                _log(f"yt-dlp found no captions for {video_id}, trying direct HTTP fallback")
-                raw_vtt = _fetch_transcript_direct(video_id, status=status)
+                raw_vtt = _fetch_transcript_ytdlp_via_ssh(video_id, ssh_host)
+        except _YtdlpBlocked:
+            skip_ytdlp = True
+        else:
+            if not raw_vtt:
+                if (token or ta_key) and _youtube_transcripts_blocked():
+                    skip_ytdlp = True
+                else:
+                    _log(f"SSH yt-dlp transcript failed for {video_id}, trying direct HTTP fallback")
+                    raw_vtt = _fetch_transcript_direct(video_id, status=status)
+    elif is_ytdlp_installed():
+        try:
+            raw_vtt = _fetch_transcript_ytdlp(
+                video_id, temp_dir, status=status, fast_fail=bool(token or ta_key),
+            )
+        except _YtdlpBlocked:
+            skip_ytdlp = True
+        else:
+            if not raw_vtt:
+                ytdlp_error = (status or {}).get("ytdlp_error")
+                if ytdlp_error:
+                    # Hard failure (429 / bot-gate / timeout). The direct-HTTP
+                    # fallback is also YouTube-blocked, so skip it and let the
+                    # ScrapeCreators fallback below handle it when a key is present.
+                    # A 429 or bot-check also stops later videos in this search
+                    # from starting another yt-dlp call.
+                    _note_youtube_block(ytdlp_error)
+                    _log(f"Transcript fetch failed for {video_id}: {ytdlp_error}")
+                else:
+                    _log(f"yt-dlp found no captions for {video_id}, trying direct HTTP fallback")
+                    raw_vtt = _fetch_transcript_direct(video_id, status=status)
     else:
         _log("yt-dlp not installed, using direct HTTP transcript fetch")
         raw_vtt = _fetch_transcript_direct(video_id, status=status)
+
+    if skip_ytdlp:
+        _log(
+            f"Skipping yt-dlp transcript for {video_id} after a YouTube "
+            f"bot-check or rate limit"
+        )
 
     if raw_vtt:
         transcript = _clean_vtt(raw_vtt)
@@ -1108,8 +1610,18 @@ def fetch_transcript(
     # the video was not proven caption-less, fall back to the SC transcript
     # endpoint (fetched server-side: no 429, cookies, or PO tokens). Returns
     # already-cleaned, word-capped plaintext.
-    if token and _should_try_sc_transcript(status):
-        sc_transcript = _sc_fetch_transcript(video_id, token)
+    if (
+        token
+        and _should_try_sc_transcript(status)
+        and not _lane_out_of_time()
+        and (rescue_budget is None or rescue_budget.reserve())
+    ):
+        sc_transcript = None
+        try:
+            sc_transcript = _sc_fetch_transcript(video_id, token)
+        finally:
+            if rescue_budget is not None:
+                rescue_budget.settle(bool(sc_transcript))
         if sc_transcript:
             # The keyless cascade (yt-dlp / direct HTTP) already logged its
             # failure above. Without this line that failure is the last thing
@@ -1142,6 +1654,7 @@ def fetch_transcripts_parallel(
     max_workers: int = 5,
     out_captions_disabled: Optional[Set[str]] = None,
     token: Optional[str] = None,
+    max_sc_rescues: Optional[int] = None,
 ) -> Dict[str, Optional[str]]:
     """Fetch transcripts for multiple videos in parallel.
 
@@ -1154,35 +1667,71 @@ def fetch_transcripts_parallel(
         token: Optional ScrapeCreators API key, threaded to each
             ``fetch_transcript`` so the per-video SC fallback activates on
             yt-dlp failure. None preserves keyless behavior.
+        max_sc_rescues: Cap on successful SC rescues across the batch,
+            normally the transcript target. Callers try up to 3x the target so
+            free fetches have headroom; without a cap every yt-dlp failure in
+            that headroom was a paid call. None = no cap.
 
     Returns:
-        Dict mapping video_id to transcript text (or None).
+        Dict mapping video_id to transcript text (or None). A video still
+        fetching when the lane ran out of time has no entry.
     """
+    with _youtube_block_scope():
+        return _fetch_transcripts_parallel(
+            video_ids,
+            max_workers=max_workers,
+            out_captions_disabled=out_captions_disabled,
+            token=token,
+            max_sc_rescues=max_sc_rescues,
+        )
+
+
+def _fetch_transcripts_parallel(
+    video_ids: List[str],
+    max_workers: int = 5,
+    out_captions_disabled: Optional[Set[str]] = None,
+    token: Optional[str] = None,
+    max_sc_rescues: Optional[int] = None,
+) -> Dict[str, Optional[str]]:
     if not video_ids:
         return {}
+    rescue_budget = _RescueBudget(max_sc_rescues) if max_sc_rescues is not None else None
 
     _log(f"Fetching transcripts for {len(video_ids)} videos")
 
     results = {}
     statuses: Dict[str, Dict[str, Any]] = {vid: {} for vid in video_ids}
-    with tempfile.TemporaryDirectory() as temp_dir:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    unfinished: List[str] = []
+    seconds_left = _lane_seconds_left()
+    # A yt-dlp child killed at the lane deadline can still be writing here.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {
                 http.submit_with_context(
                     executor, fetch_transcript, vid, temp_dir, statuses[vid], token,
+                    rescue_budget=rescue_budget,
                 ): vid
                 for vid in video_ids
             }
-            for future in as_completed(futures):
-                vid = futures[future]
-                try:
-                    results[vid] = future.result()
-                except OSError as exc:
-                    _log(f"Transcript fetch error for {vid}: {exc}")
-                    results[vid] = None
-                except Exception as exc:
-                    _log(f"Unexpected transcript error for {vid}: {type(exc).__name__}: {exc}")
-                    results[vid] = None
+            try:
+                for future in as_completed(
+                    futures, timeout=None if seconds_left is None else max(0.0, seconds_left),
+                ):
+                    vid = futures[future]
+                    try:
+                        results[vid] = future.result()
+                    except OSError as exc:
+                        _log(f"Transcript fetch error for {vid}: {exc}")
+                        results[vid] = None
+                    except Exception as exc:
+                        _log(f"Unexpected transcript error for {vid}: {type(exc).__name__}: {exc}")
+                        results[vid] = None
+            except FuturesTimeout:
+                unfinished = [vid for future, vid in futures.items() if vid not in results]
+                _log(f"Stopped waiting for {len(unfinished)} transcripts: the lane is out of time")
+        finally:
+            executor.shutdown(wait=not unfinished, cancel_futures=bool(unfinished))
 
     if out_captions_disabled is not None:
         for vid, st in statuses.items():
@@ -1210,7 +1759,7 @@ def fetch_transcripts_parallel(
 
 def backfill_transcripts(
     items: List[Any], topic: str = "", depth: str = "default",
-    token: Optional[str] = None,
+    token: Optional[str] = None, entity_count: int = 1,
 ) -> None:
     """Second-pass transcript fetch for finalized items that lack one (#542).
 
@@ -1218,7 +1767,9 @@ def backfill_transcripts(
     ``fetch_transcripts_parallel`` so the SC fallback covers backfill survivors
     that yt-dlp can't fetch. None preserves keyless behavior.
     """
-    limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
+    limit = comparison_share(
+        TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"]), entity_count,
+    )
     if limit <= 0 or not items or not is_ytdlp_installed():
         return
     have = sum(
@@ -1244,6 +1795,7 @@ def backfill_transcripts(
         [it.item_id for it in attempts],
         out_captions_disabled=captions_disabled,
         token=token,
+        max_sc_rescues=need,
     )
     for it in attempts:
         if it.item_id in captions_disabled:
@@ -1295,6 +1847,7 @@ def search_and_transcribe(
     depth: str = "default",
     token: Optional[str] = None,
     freshness_mode: Optional[str] = None,
+    entity_count: int = 1,
 ) -> Dict[str, Any]:
     """Full YouTube search: find videos, then fetch transcripts for top results.
 
@@ -1309,22 +1862,59 @@ def search_and_transcribe(
         token: Optional ScrapeCreators key for the per-video transcript
             fallback (threaded to fetch_transcripts_parallel).
         freshness_mode: Plan freshness mode, threaded to search_youtube().
+        entity_count: Comparison entities sharing the yt-dlp slots; each
+            gets ``comparison_share`` of the queries and transcripts.
 
     Returns:
         Dict with 'items' list. Each item has a 'transcript_snippet' field.
     """
-    # Step 1: Multi-query search — run yt-dlp for each expanded query
-    queries = expand_youtube_queries(topic, depth)
+    with _youtube_block_scope():
+        return _search_and_transcribe(
+            topic, from_date, to_date, depth, token, freshness_mode, entity_count,
+        )
+
+
+def _search_and_transcribe(
+    topic: str,
+    from_date: str,
+    to_date: str,
+    depth: str = "default",
+    token: Optional[str] = None,
+    freshness_mode: Optional[str] = None,
+    entity_count: int = 1,
+) -> Dict[str, Any]:
+    # Step 1: Multi-query search — run yt-dlp for each expanded query.
+    # Leave a reserve for transcripts: another full search is not worth
+    # starting once the lane has less than that left.
+    transcript_limit = comparison_share(
+        TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"]), entity_count,
+    )
+    reserve = _transcript_search_reserve(transcript_limit)
+    queries = expand_youtube_queries(topic, depth, entity_count)
     seen_ids: Set[str] = set()
     items: List[Dict[str, Any]] = []
     search_error: Optional[str] = None
-    for q in queries:
+    skipped_queries = 0
+    for done_queries, q in enumerate(queries):
+        if items and _lane_out_of_time():
+            skipped_queries = len(queries) - done_queries
+            _log(f"Skipping {skipped_queries} YouTube searches: the lane is out of time")
+            break
+        if items and _lane_under_transcript_reserve(reserve):
+            held = len(queries) - done_queries
+            seconds_left = _lane_seconds_left() or 0.0
+            _log(
+                f"Skipping {held} YouTube searches: {seconds_left:.0f}s left, "
+                f"under the {reserve:.0f}s transcript reserve"
+            )
+            break
         search_result = search_youtube(
             q, from_date, to_date, depth, freshness_mode=freshness_mode,
         )
         err = search_result.get("error")
         if err:
             search_error = _prefer_search_error(search_error, str(err))
+            _note_youtube_block(str(err))
         for item in search_result.get("items", []):
             vid = item.get("video_id", "")
             if vid and vid not in seen_ids:
@@ -1335,7 +1925,10 @@ def search_and_transcribe(
     items.sort(key=lambda x: x.get("engagement", {}).get("views") or 0, reverse=True)
 
     if not items:
-        return {"items": [], **({"error": search_error} if search_error else {})}
+        result = {"items": [], **({"error": search_error} if search_error else {})}
+        if _lane_out_of_time():
+            result["out_of_time"] = "no search finished before the stream deadline"
+        return result
 
     # Step 2: Fetch transcripts for top videos.
     # Sort candidates by a combination of views and recency so that recent
@@ -1344,9 +1937,9 @@ def search_and_transcribe(
     # Try more candidates than the limit because some videos (music videos,
     # short clips) lack captions. Attempt up to 3x the limit so we have a
     # good chance of reaching the target number of successful transcripts.
-    transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
     transcripts: Dict[str, Optional[str]] = {}
     captions_disabled_ids: Set[str] = set()
+    unfinished_ids: Set[str] = set()
     if transcript_limit > 0:
         attempt_count = min(len(items), transcript_limit * 3)
         transcript_candidates = sorted(
@@ -1356,13 +1949,16 @@ def search_and_transcribe(
         _log(f"Fetching transcripts for up to {attempt_count} videos (target: {transcript_limit}): {candidate_ids}")
         transcripts = fetch_transcripts_parallel(
             candidate_ids, out_captions_disabled=captions_disabled_ids,
-            token=token,
+            token=token, max_sc_rescues=transcript_limit,
         )
+        unfinished_ids = {vid for vid in candidate_ids if vid not in transcripts}
         # Record fetch outcomes (captions-disabled videos can never succeed,
-        # so they don't count as failures) for the stale-yt-dlp nudge.
-        _TRANSCRIPT_FETCH_STATS["attempts"] += len(candidate_ids)
+        # and unfinished ones never ran to an answer, so neither counts as a
+        # failure) for the stale-yt-dlp nudge.
+        finished_ids = [vid for vid in candidate_ids if vid not in unfinished_ids]
+        _TRANSCRIPT_FETCH_STATS["attempts"] += len(finished_ids)
         _TRANSCRIPT_FETCH_STATS["failures"] += sum(
-            1 for vid in candidate_ids
+            1 for vid in finished_ids
             if not transcripts.get(vid) and vid not in captions_disabled_ids
         )
     else:
@@ -1387,6 +1983,17 @@ def search_and_transcribe(
         # Partial coverage: some queries succeeded; keep the failure visible so
         # source_status becomes partial/timeout rather than a quiet OK.
         result["error"] = search_error
+    cut = []
+    if skipped_queries:
+        cut.append(f"skipped {skipped_queries} of {len(queries)} searches")
+    if unfinished_ids:
+        cut.append(f"left {len(unfinished_ids)} of {len(candidate_ids)} transcript fetches unfinished")
+    if cut:
+        result["out_of_time"] = f"{' and '.join(cut)} to return before the stream deadline"
+    elif _lane_out_of_time():
+        # Transcript fetches that hit the deadline answer None instead of
+        # going missing, so the deadline itself is the signal.
+        result["out_of_time"] = "reached the stream deadline while fetching transcripts"
     return result
 
 
@@ -1420,6 +2027,7 @@ def enrich_with_comments(
     token: str,
     max_videos: int = 3,
     max_comments: int = 5,
+    entity_count: int = 1,
 ) -> List[Dict[str, Any]]:
     """Enrich top YouTube videos with comment data from ScrapeCreators.
 
@@ -1431,10 +2039,13 @@ def enrich_with_comments(
         token: ScrapeCreators API key
         max_videos: How many videos to enrich with comments
         max_comments: Max comments to keep per video
+        entity_count: Comparison entities sharing the yt-dlp slots; each
+            enriches ``comparison_share`` of ``max_videos``.
 
     Returns:
         Items list (mutated in place) with top_comments added to enriched items.
     """
+    max_videos = comparison_share(max_videos, entity_count)
     if not items or max_videos <= 0:
         return items
     # yt-dlp needs no key, so an empty token is only fatal when it is absent too.
@@ -1570,7 +2181,7 @@ def _fetch_video_comments(
     if ran_cleanly:
         return []
 
-    if not token:
+    if not token or _sc_spend_blocked(f"comments for {video_id}"):
         return []
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -1581,6 +2192,7 @@ def _fetch_video_comments(
             headers=http.scrapecreators_headers(token),
             timeout=30,
             retries=2,
+            **_sc_request_bounds(),
         )
     except Exception as exc:
         _log(f"Comment fetch error for {video_id}: {exc}")
@@ -1631,6 +2243,7 @@ def search_youtube_sc(
     token: str = None,
     skip_transcript_ids: Optional[Set[str]] = None,
     freshness_mode: Optional[str] = None,
+    entity_count: int = 1,
 ) -> Dict[str, Any]:
     """Search YouTube via ScrapeCreators when yt-dlp is absent, empty, or thin.
 
@@ -1646,6 +2259,8 @@ def search_youtube_sc(
         skip_transcript_ids: Video IDs already transcribed by the free search
         freshness_mode: Plan freshness mode; scopes the out-of-window
             fallback (see _apply_date_window). None keeps the soft fallback.
+        entity_count: Comparison entities; each pays for
+            ``comparison_share`` of the transcript target.
 
     Returns:
         Dict with 'items' list of video metadata dicts.
@@ -1711,7 +2326,9 @@ def search_youtube_sc(
     items.sort(key=lambda x: x["engagement"]["views"], reverse=True)
 
     # Step 2: Fetch transcripts for top videos
-    transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
+    transcript_limit = comparison_share(
+        TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"]), entity_count,
+    )
     if transcript_limit > 0 and items:
         # Same in-window-first ordering as search_and_transcribe(): don't let
         # an out-of-window back-catalog (kept by the soft date filter above)
@@ -1725,11 +2342,21 @@ def search_youtube_sc(
         ]
         attempt_count = min(len(transcript_candidates), transcript_limit * 3)
         _log(f"Fetching SC transcripts for up to {attempt_count} videos (target: {transcript_limit})")
+        # Transcripts the free search already has count toward the target, so
+        # a thin backfill tops up to it instead of paying for a full target
+        # on top of them.
+        got = len(excluded_ids)
         for item in transcript_candidates[:attempt_count]:
+            # Each attempt is paid: stop once the target is met. The 3x
+            # headroom is only for videos that come back without captions.
+            if got >= transcript_limit:
+                break
             vid = item["video_id"]
             if not vid:
                 continue
             transcript = _sc_fetch_transcript(vid, token)
+            if transcript:
+                got += 1
             item["transcript_snippet"] = transcript or ""
             item["transcript_highlights"] = extract_transcript_highlights(
                 transcript or "", core_topic,
@@ -1753,6 +2380,8 @@ def _sc_youtube_search(keyword: str, token: str) -> List[Dict[str, Any]]:
     Returns:
         List of raw video dicts from the API.
     """
+    if _sc_spend_blocked(f"search for {keyword!r}"):
+        return []
     try:
         # SC's /v1/youtube/search rejects ?keyword= with HTTP 400; the canonical
         # parameter for that endpoint is `query`. Other SC endpoints use their
@@ -1763,6 +2392,7 @@ def _sc_youtube_search(keyword: str, token: str) -> List[Dict[str, Any]]:
             headers=http.scrapecreators_headers(token),
             timeout=30,
             retries=2,
+            **_sc_request_bounds(),
         )
         return data.get("videos", data.get("data", data.get("items", [])))
     except Exception as exc:
@@ -1804,14 +2434,23 @@ def _sc_fetch_transcript(video_id: str, token: str) -> Optional[str]:
     Returns:
         Plaintext transcript string, or None if unavailable.
     """
+    if _sc_spend_blocked(f"transcript for {video_id}"):
+        return None
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     transcript = None
     deadline = time.monotonic() + _SC_TRANSCRIPT_TIMEOUT
     # Without a language the endpoint may return an auto-dubbed track (#1169).
-    languages = list(dict.fromkeys(_ytdlp_sub_langs().split(",")))[:_SC_TRANSCRIPT_MAX_LANGUAGES]
+    # SC takes plain codes; a configured `en-orig` means `en` here (#1314).
+    languages = list(dict.fromkeys(
+        code.removesuffix("-orig") for code in _ytdlp_sub_langs().split(",")
+    ))[:_SC_TRANSCRIPT_MAX_LANGUAGES]
     for language in languages:
         if time.monotonic() >= deadline:
             break
+        # The run can end while an earlier language is in flight; don't
+        # buy the next one.
+        if language != languages[0] and _sc_spend_blocked(f"transcript for {video_id}"):
+            return None
         try:
             # Isolate SC transcript fetch errors from the pipeline-level
             # capture_failures() context.
@@ -1823,8 +2462,8 @@ def _sc_fetch_transcript(video_id: str, token: str) -> Optional[str]:
                     timeout=_SC_TRANSCRIPT_TIMEOUT,
                     retries=1,
                     max_429_retries=0,
-                    deadline_monotonic=deadline,
                     owned_get=True,
+                    **_sc_request_bounds(deadline),
                 )
         except Exception as exc:
             _log(f"SC transcript error for {video_id} ({language}): {exc}")

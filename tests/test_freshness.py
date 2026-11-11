@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import last30days as cli
 from lib import freshness, github, health, hosted, http, planner, polymarket, render, schema, stocktwits
 
@@ -324,6 +326,285 @@ def test_status_assertion_without_positive_rederivation_is_unsupported():
 
     assert verdict.verdict == "unsupported"
     assert "re-derived" in (verdict.detail or "")
+
+
+@pytest.mark.parametrize("original_status, opposite_status", [
+    ("open", "closed"), ("closed", "open"),
+])
+def test_latest_matching_status_blocks_an_intermediate_contradiction(
+    original_status, opposite_status,
+):
+    original = _item(
+        "reddit", item_id="original",
+        title=f"Widget API is {original_status}",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    intermediate = _item(
+        "grounding", item_id="intermediate",
+        title=f"Widget API is {opposite_status}",
+        published_at="2026-07-05T10:00:00Z",
+        url="https://status.example.com/widget/intermediate",
+    )
+    latest = _item(
+        "grounding", item_id="latest",
+        title=f"Widget API is {original_status}",
+        published_at="2026-07-09T10:00:00Z",
+        url="https://status.example.com/widget/latest",
+    )
+    unrelated = _item(
+        "grounding", item_id="unrelated",
+        title=f"Other API is {opposite_status}",
+        published_at="2026-07-10T10:00:00Z",
+    )
+    report = _report(original, latest, intermediate, unrelated)
+
+    verdicts = freshness.verify_report(report)
+    by_item = {verdict.source_item_id: verdict for verdict in verdicts}
+
+    assert by_item[original.item_id].verdict == "unsupported"
+    assert by_item[original.item_id].current_value is None
+    assert by_item[original.item_id].evidence_url == ""
+    assert by_item[intermediate.item_id].verdict == "contradicted"
+    assert by_item[intermediate.item_id].current_value == original_status
+    assert by_item[intermediate.item_id].evidence_url == latest.url
+    assert by_item[intermediate.item_id].evidence_timestamp == latest.published_at
+
+
+def test_newest_opposite_status_wins_over_intermediate_agreement():
+    original = _item(
+        "reddit", item_id="original", title="Widget API is open",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    report = _report(original)
+    latest = _item(
+        "grounding", item_id="latest", title="Widget API is closed",
+        published_at="2026-07-09T10:00:00Z",
+        url="https://status.example.com/widget/latest",
+    )
+    report.items_by_source["grounding"] = [
+        _item(
+            "grounding", item_id="intermediate", title="Widget API is open",
+            published_at="2026-07-05T10:00:00Z",
+        ),
+        latest,
+    ]
+
+    verdict = freshness.verify_report(report)[0]
+
+    assert verdict.verdict == "contradicted"
+    assert verdict.current_value == "closed"
+    assert verdict.evidence_url == latest.url
+    assert verdict.evidence_timestamp == latest.published_at
+
+
+@pytest.mark.parametrize("original_status, opposite_status", [
+    ("open", "closed"), ("closed", "open"),
+])
+@pytest.mark.parametrize("agreement_field, contradiction_field", [
+    ("title", "snippet"), ("title", "body"),
+    ("snippet", "body"), ("body", "title"),
+])
+def test_newest_item_agreement_cannot_hide_its_contradictory_assertion(
+    original_status, opposite_status, agreement_field, contradiction_field,
+):
+    original = _item(
+        "reddit", item_id="original", title=f"Widget API is {original_status}",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    fields = {"title": "Status update", "snippet": "", "body": ""}
+    fields[agreement_field] = f"Widget API was {original_status}"
+    fields[contradiction_field] = f"Widget API is {opposite_status}"
+    latest = _item(
+        "grounding", item_id="latest", **fields,
+        published_at="2026-07-09T10:00:00Z",
+        url="https://status.example.com/widget/latest",
+    )
+    report = _report(original)
+    report.items_by_source["grounding"] = [latest]
+
+    verdict = freshness.verify_report(report)[0]
+
+    assert verdict.verdict == "contradicted"
+    assert verdict.current_value == opposite_status
+    assert verdict.evidence_url == latest.url
+    assert verdict.evidence_timestamp == latest.published_at
+
+
+@pytest.mark.parametrize("original_status, opposite_status", [
+    ("open", "closed"), ("closed", "open"),
+])
+@pytest.mark.parametrize("current_field, historical_field", [
+    ("title", "body"), ("body", "title"),
+    ("title", "snippet"), ("snippet", "title"),
+    ("snippet", "body"), ("body", "snippet"),
+])
+def test_current_agreement_is_not_overridden_by_historical_opposite(
+    original_status, opposite_status, current_field, historical_field,
+):
+    original = _item(
+        "reddit", item_id="original", title=f"Widget API is {original_status}",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    fields = {"title": "Status update", "snippet": "", "body": ""}
+    fields[current_field] = f"Widget API is {original_status}"
+    fields[historical_field] = f"Widget API was {opposite_status}"
+    report = _report(original)
+    report.items_by_source["grounding"] = [_item(
+        "grounding", item_id="latest", **fields,
+        published_at="2026-07-09T10:00:00Z",
+    )]
+
+    verdict = freshness.verify_report(report)[0]
+
+    assert verdict.verdict == "unsupported"
+    assert verdict.current_value is None
+    assert verdict.evidence_url == ""
+
+
+@pytest.mark.parametrize("field", ["title", "snippet", "body"])
+@pytest.mark.parametrize("current_first", [True, False])
+@pytest.mark.parametrize("current_status", ["open", "closed"])
+def test_current_status_wins_over_history_within_one_field(field, current_first, current_status):
+    original = _item(
+        "reddit", item_id="original", title="Widget API is open",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    historical_status = "closed" if current_status == "open" else "open"
+    sentences = [f"Widget API is {current_status}.", f"Widget API was {historical_status}."]
+    fields = {"title": "Status update", "snippet": "", "body": ""}
+    fields[field] = " ".join(sentences if current_first else reversed(sentences))
+    latest = _item(
+        "grounding", item_id="latest", **fields,
+        published_at="2026-07-09T10:00:00Z",
+        url="https://status.example.com/widget/latest",
+    )
+    report = _report(original)
+    report.items_by_source["grounding"] = [latest]
+
+    verdict = freshness.verify_report(report)[0]
+
+    if current_status == "open":
+        assert verdict.verdict == "unsupported"
+        assert verdict.current_value is None
+        assert verdict.evidence_url == ""
+    else:
+        assert verdict.verdict == "contradicted"
+        assert verdict.current_value == "closed"
+        assert verdict.evidence_url == latest.url
+        assert verdict.evidence_timestamp == latest.published_at
+
+
+@pytest.mark.parametrize("title, body", [
+    ("Widget API is open", "Widget API is closed"),
+    ("Widget API is closed", "Widget API is open"),
+])
+def test_conflicting_current_statuses_in_latest_item_remain_unsupported(title, body):
+    original = _item(
+        "reddit", item_id="original", title="Widget API is open",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    report = _report(original)
+    report.items_by_source["grounding"] = [
+        _item(
+            "grounding", item_id="intermediate", title="Widget API is closed",
+            published_at="2026-07-05T10:00:00Z",
+        ),
+        _item(
+            "grounding", item_id="latest", title=title, body=body,
+            published_at="2026-07-09T10:00:00Z",
+        ),
+    ]
+
+    verdict = freshness.verify_report(report)[0]
+
+    assert verdict.verdict == "unsupported"
+    assert verdict.current_value is None
+    assert verdict.evidence_url == ""
+
+
+@pytest.mark.parametrize("verb", ["is", "remains", "was", "became", "has been"])
+def test_standalone_supported_copulas_preserve_status_verification(verb):
+    original = _item(
+        "reddit", item_id="original", title="Widget API is open",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    report = _report(original)
+    latest = _item(
+        "grounding", item_id="latest", title=f"Widget API {verb} closed",
+        snippet="Other API is open",
+        published_at="2026-07-09T10:00:00Z",
+        url="https://status.example.com/widget/latest",
+    )
+    report.items_by_source["grounding"] = [latest]
+
+    verdict = freshness.verify_report(report)[0]
+
+    assert verdict.verdict == "contradicted"
+    assert verdict.current_value == "closed"
+    assert verdict.evidence_url == latest.url
+    assert verdict.evidence_timestamp == latest.published_at
+
+
+@pytest.mark.parametrize("current_verb, historical_verb", [
+    ("remains", "was"), ("is", "became"),
+    ("is", "has been"), ("has been", "was"),
+])
+@pytest.mark.parametrize("current_status", ["open", "closed"])
+def test_explicit_current_status_takes_precedence_over_less_current_forms(
+    current_verb, historical_verb, current_status,
+):
+    original = _item(
+        "reddit", item_id="original", title="Widget API is open",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    historical_status = "closed" if current_status == "open" else "open"
+    latest = _item(
+        "grounding", item_id="latest",
+        title=f"Widget API {historical_verb} {historical_status}",
+        body=f"Widget API {current_verb} {current_status}",
+        published_at="2026-07-09T10:00:00Z",
+        url="https://status.example.com/widget/latest",
+    )
+    report = _report(original)
+    report.items_by_source["grounding"] = [latest]
+
+    verdict = freshness.verify_report(report)[0]
+
+    if current_status == "open":
+        assert verdict.verdict == "unsupported"
+        assert verdict.current_value is None
+        assert verdict.evidence_url == ""
+    else:
+        assert verdict.verdict == "contradicted"
+        assert verdict.current_value == "closed"
+        assert verdict.evidence_url == latest.url
+        assert verdict.evidence_timestamp == latest.published_at
+
+
+@pytest.mark.parametrize("unrelated_status", ["closed", "open"])
+def test_newest_item_agreement_ignores_another_subjects_status(unrelated_status):
+    original = _item(
+        "reddit", item_id="original", title="Widget API is open",
+        published_at="2026-07-01T10:00:00Z",
+    )
+    report = _report(original)
+    report.items_by_source["grounding"] = [
+        _item(
+            "grounding", item_id="intermediate", title="Widget API is closed",
+            published_at="2026-07-05T10:00:00Z",
+        ),
+        _item(
+            "grounding", item_id="latest", title="Widget API is open",
+            snippet=f"Other API is {unrelated_status}",
+            published_at="2026-07-09T10:00:00Z",
+        ),
+    ]
+
+    verdict = freshness.verify_report(report)[0]
+
+    assert verdict.verdict == "unsupported"
+    assert verdict.current_value is None
+    assert verdict.evidence_url == ""
 
 
 def test_status_contradiction_requires_subject_bound_to_opposite_status():
@@ -1110,6 +1391,130 @@ def test_slug_refetch_rejects_same_slug_different_event_id(monkeypatch):
     assert polymarket.refetch_datum(cached, "Yes") is not None
 
 
+def _ladder_event(questions_and_prices):
+    return {
+        "id": "77",
+        "slug": "ladder",
+        "title": "Ladder by...?",
+        "updatedAt": "2026-11-10T12:00:00Z",
+        "markets": [
+            {
+                "active": True,
+                "closed": False,
+                "question": question,
+                "liquidity": str(100 - index),
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": f'["{price}", "{round(1 - price, 3)}"]',
+            }
+            for index, (question, price) in enumerate(questions_and_prices)
+        ],
+    }
+
+
+_LONG_TAIL = "after the annual shareholder meeting held in Santa Clara in June 2027?"
+
+
+@pytest.mark.parametrize(
+    "questions, saved_names",
+    [
+        # The old name was cut at 40 characters and then lost its leading
+        # article, so it is shorter than 40 and no prefix of the new name.
+        pytest.param(
+            [
+                "The Nvidia board removes Jensen Huang by June 30, 2027?",
+                "The Nvidia board removes Jensen Huang by December 31, 2026?",
+            ],
+            ["Nvidia board removes Jensen Huang by", "Nvidia board removes Jensen Huang by"],
+            id="the-ladder",
+        ),
+        pytest.param(
+            [
+                "A successor to Jensen Huang is named by June 30, 2027?",
+                "Nvidia stock above 200 dollars on December 31, 2026?",
+            ],
+            ["successor to Jensen Huang is named by ", "Nvidia stock above 200 dollars on Decemb"],
+            id="a-and-plain",
+        ),
+        pytest.param(
+            [
+                "An Nvidia chief executive other than Jensen Huang by June 30, 2027?",
+                "An Nvidia chief executive other than Jensen Huang by December 31, 2026?",
+            ],
+            ["Nvidia chief executive other than Jen", "Nvidia chief executive other than Jen"],
+            id="an-ladder",
+        ),
+        # A question longer than the new limit is cut in both, at other places.
+        pytest.param(
+            [
+                "The Nvidia board announces a successor to Jensen Huang " + _LONG_TAIL,
+                "Jensen Huang announces his own successor as chief executive " + _LONG_TAIL,
+            ],
+            ["Nvidia board announces a successor t", "Jensen Huang announces his own successor"],
+            id="longer-than-the-new-limit",
+        ),
+        # Names the old "Will ..." rules produced are the names of today.
+        pytest.param(
+            [
+                "Will Arizona win the 2026 NCAA Tournament?",
+                "Will the Duke Blue Devils be a number 1 seed?",
+            ],
+            ["Arizona", "the Duke Blue Devils"],
+            id="will-subject",
+        ),
+        pytest.param(
+            [
+                "Will Jensen Huang step down?",
+                "Will Lisa Su step down?",
+            ],
+            ["Jensen", "Lisa"],
+            id="will-short-subject",
+        ),
+    ],
+)
+def test_polymarket_refetch_matches_every_name_the_old_shortener_saved(
+    monkeypatch, questions, saved_names
+):
+    prices = [0.32, 0.2]
+    item = _item(
+        "polymarket",
+        title="Ladder by...?",
+        url="https://polymarket.com/event/ladder",
+        metadata={
+            "event_id": "77",
+            "outcome_prices": [list(pair) for pair in zip(saved_names, prices)],
+        },
+    )
+    event = _ladder_event(list(zip(questions, prices)))
+    monkeypatch.setattr(polymarket.http, "request", lambda *_a, **_k: event)
+
+    verdicts = freshness.verify_report(_report(item))
+
+    assert [verdict.verdict for verdict in verdicts] == ["current", "current"]
+
+
+def test_polymarket_refetch_old_cut_name_reads_its_own_market(monkeypatch):
+    # Both old names are the same text; the second one is the second market.
+    saved = "Nvidia board removes Jensen Huang by"
+    item = _item(
+        "polymarket",
+        title="Ladder by...?",
+        url="https://polymarket.com/event/ladder",
+        metadata={"event_id": "77", "outcome_prices": [[saved, 0.32], [saved, 0.2]]},
+    )
+    event = _ladder_event(
+        [
+            ("The Nvidia board removes Jensen Huang by June 30, 2027?", 0.32),
+            ("The Nvidia board removes Jensen Huang by December 31, 2026?", 0.05),
+        ]
+    )
+    monkeypatch.setattr(polymarket.http, "request", lambda *_a, **_k: event)
+
+    verdicts = freshness.verify_report(_report(item))
+
+    assert [verdict.verdict for verdict in verdicts] == ["current", "stale"]
+    assert verdicts[1].current_value == 0.05
+
+
 def test_slug_refetch_fails_closed_without_any_event_identity(monkeypatch):
     """A synthetic PM<N> parse id carries no identity, so slug equality alone
     must not verify a claim; the refetch fails closed to unsupported."""
@@ -1128,3 +1533,77 @@ def test_slug_refetch_fails_closed_without_any_event_identity(monkeypatch):
     with pytest.raises(ValueError):
         polymarket.refetch_datum(cached, "Yes")
     assert calls == []  # fails closed before any network request
+
+
+def test_polymarket_refetch_matches_names_saved_with_the_old_forty_character_cut(monkeypatch):
+    # Reports saved before sub-market names were kept whole hold names cut at
+    # 40 characters, so sibling deadlines collapsed to one repeated name.
+    cut = "Jensen Huang announced resignation or re"
+    item = _item(
+        "polymarket",
+        title="Jensen Huang announced resignation or removal by...?",
+        url="https://polymarket.com/event/jensen-huang-out",
+        metadata={
+            "event_id": "77",
+            "outcome_prices": [[cut, 0.32], [cut, 0.2]],
+        },
+    )
+    event = {
+        "id": "77",
+        "slug": "jensen-huang-out",
+        "title": "Jensen Huang announced resignation or removal by...?",
+        "updatedAt": "2026-11-10T12:00:00Z",
+        "markets": [
+            {
+                "active": True,
+                "closed": False,
+                "question": "Jensen Huang announced resignation or removal by June 30, 2027?",
+                "liquidity": "100",
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.32", "0.68"]',
+            },
+            {
+                "active": True,
+                "closed": False,
+                "question": "Jensen Huang announced resignation or removal by December 31, 2026?",
+                "liquidity": "90",
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.2", "0.8"]',
+            },
+        ],
+    }
+    monkeypatch.setattr(polymarket.http, "request", lambda *_a, **_k: event)
+
+    verdicts = freshness.verify_report(_report(item))
+
+    assert [verdict.verdict for verdict in verdicts] == ["current", "current"]
+
+
+def test_polymarket_refetch_reads_a_repeated_subject_name_from_its_own_market(monkeypatch):
+    # A run saved while sibling brackets were all named by their subject holds
+    # "Waymo" three times. Each still reads its own bracket, now that the
+    # brackets carry their own labels.
+    item = _item(
+        "polymarket",
+        title="How many cities will Waymo operate in by December 31?",
+        url="https://polymarket.com/event/ladder",
+        metadata={
+            "event_id": "77",
+            "outcome_prices": [["Waymo", 0.79], ["Waymo", 0.12], ["Waymo", 0.046]],
+        },
+    )
+    event = _ladder_event(
+        [
+            ("Will Waymo operate in 12-15 cities on December 31 2026?", 0.79),
+            ("Will Waymo operate in 16-19 cities on December 31 2026?", 0.3),
+            ("Will Waymo operate in fewer than 12 cities on December 31 2026?", 0.046),
+        ]
+    )
+    for market, label in zip(event["markets"], ("12-15", "16-19", "<12")):
+        market["groupItemTitle"] = label
+    monkeypatch.setattr(polymarket.http, "request", lambda *_a, **_k: event)
+
+    verdicts = freshness.verify_report(_report(item))
+
+    assert [verdict.verdict for verdict in verdicts] == ["current", "stale", "current"]
+    assert verdicts[1].current_value == 0.3

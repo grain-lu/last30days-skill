@@ -12,6 +12,8 @@ falls back to web discovery + yt-dlp (lib.shortform_oss).
 
 import re
 import sys
+import threading
+import time
 from typing import Any, Dict, List, Optional, Set
 
 from . import dates, http, log
@@ -28,8 +30,17 @@ DEPTH_CONFIG = {
 # Max words to keep from each caption
 CAPTION_MAX_WORDS = 500
 
+BUDGET_ERROR = "TikTok timed out: research budget exhausted or cancelled"
+
 from .query import infer_query_intent
 from .relevance import token_overlap_relevance as _compute_relevance
+
+
+def _check_budget(deadline: float | None, cancel: threading.Event | None) -> None:
+    if (cancel is not None and cancel.is_set()) or (
+        deadline is not None and time.monotonic() >= deadline
+    ):
+        raise http.DeadlineExceeded()
 
 
 def _extract_core_subject(topic: str) -> str:
@@ -179,6 +190,9 @@ def _parse_items(raw_items: List[Dict[str, Any]], core_topic: str) -> List[Dict[
 def _hashtag_search(
     hashtag: str,
     token: str,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> List[Dict[str, Any]]:
     """Search TikTok by hashtag via ScrapeCreators.
 
@@ -189,6 +203,7 @@ def _hashtag_search(
     Returns:
         List of raw TikTok item dicts (aweme_info format).
     """
+    _check_budget(deadline, cancel)
     _log(f"Hashtag search: #{hashtag}")
     try:
         data = http.get(
@@ -197,7 +212,11 @@ def _hashtag_search(
             headers=http.scrapecreators_headers(token),
             timeout=30,
             retries=2,
+            deadline_monotonic=deadline,
+            cancel=cancel,
         )
+    except http.DeadlineExceeded:
+        raise
     except Exception as e:
         _log(f"Hashtag search error for #{hashtag}: {e}")
         return []
@@ -211,6 +230,9 @@ def _profile_videos(
     handle: str,
     token: str,
     count: int = 10,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> List[Dict[str, Any]]:
     """Fetch a TikTok creator's recent videos via ScrapeCreators.
 
@@ -222,6 +244,7 @@ def _profile_videos(
     Returns:
         List of raw TikTok item dicts (aweme_info format).
     """
+    _check_budget(deadline, cancel)
     _log(f"Profile videos: @{handle}")
     profile_url = "https://api.scrapecreators.com/v3/tiktok/profile/videos"
     try:
@@ -231,7 +254,11 @@ def _profile_videos(
             headers=http.scrapecreators_headers(token),
             timeout=30,
             retries=2,
+            deadline_monotonic=deadline,
+            cancel=cancel,
         )
+    except http.DeadlineExceeded:
+        raise
     except Exception as e:
         _log(f"Profile videos error for @{handle}: {e}")
         return []
@@ -247,6 +274,9 @@ def search_tiktok(
     to_date: str,
     depth: str = "default",
     token: str = None,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> Dict[str, Any]:
     """Search TikTok via ScrapeCreators API.
 
@@ -263,6 +293,7 @@ def search_tiktok(
     if not token:
         return {"items": [], "error": "No SCRAPECREATORS_API_KEY configured"}
 
+    _check_budget(deadline, cancel)
     config = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
     core_topic = _extract_core_subject(topic)
 
@@ -275,7 +306,11 @@ def search_tiktok(
             headers=http.scrapecreators_headers(token),
             timeout=30,
             retries=2,
+            deadline_monotonic=deadline,
+            cancel=cancel,
         )
+    except http.DeadlineExceeded:
+        raise
     except Exception as e:
         _log(f"ScrapeCreators error: {e}")
         return {"items": [], "error": f"{type(e).__name__}: {e}"}
@@ -315,6 +350,9 @@ def fetch_captions(
     video_items: List[Dict[str, Any]],
     token: str,
     depth: str = "default",
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> Dict[str, str]:
     """Fetch transcripts for top N TikTok videos via ScrapeCreators.
 
@@ -328,7 +366,9 @@ def fetch_captions(
         depth: Depth level for caption limit
 
     Returns:
-        Dict mapping video_id -> caption text (truncated to 500 words)
+        Dict mapping video_id -> caption text (truncated to 500 words).
+        Captions are also attached to items as they arrive, even if a later
+        request raises DeadlineExceeded.
     """
     config = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
     max_captions = config["max_captions"]
@@ -350,9 +390,11 @@ def fetch_captions(
             if len(words) > CAPTION_MAX_WORDS:
                 text = ' '.join(words[:CAPTION_MAX_WORDS]) + '...'
             captions[vid] = text
+            item["caption_snippet"] = text
 
     # Second pass: try to get spoken-word transcripts (1 credit each)
     for item in top_items:
+        _check_budget(deadline, cancel)
         vid = item["video_id"]
         url = item.get("url", "")
         if not url:
@@ -368,6 +410,8 @@ def fetch_captions(
                     headers=http.scrapecreators_headers(token),
                     timeout=15,
                     retries=1,
+                    deadline_monotonic=deadline,
+                    cancel=cancel,
                 )
             transcript = data.get("transcript")
             if transcript:
@@ -379,6 +423,9 @@ def fetch_captions(
                     if len(words) > CAPTION_MAX_WORDS:
                         transcript = ' '.join(words[:CAPTION_MAX_WORDS]) + '...'
                     captions[vid] = transcript
+                    item["caption_snippet"] = transcript
+        except http.DeadlineExceeded:
+            raise
         except Exception as e:
             _log(f"Transcript fetch failed for {vid}: {e}")
 
@@ -396,6 +443,9 @@ def search_and_enrich(
     hashtags: List[str] | None = None,
     creators: List[str] | None = None,
     config: Dict[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> Dict[str, Any]:
     """Full TikTok search: find videos, then fetch captions for top results.
 
@@ -412,54 +462,65 @@ def search_and_enrich(
         hashtags: Optional list of TikTok hashtags to search (without #)
         creators: Optional list of TikTok creator handles to fetch videos from
         config: Optional env config (discovery keys for the OSS fallback)
+        deadline: Shared monotonic deadline for search and enrichment
+        cancel: Optional research cancellation event
 
     Returns:
         Dict with 'items' list. Each item has a 'caption_snippet' field.
     """
     from . import shortform_oss
 
+    core_topic = _extract_core_subject(topic)
     seen_ids: Set[str] = set()
     items: List[Dict[str, Any]] = []
     last_error = None
 
-    # Step 0a: Hashtag search (high-signal, runs first)
-    if hashtags and token:
-        for hashtag in hashtags:
-            raw_items = _hashtag_search(hashtag, token)
-            parsed = _parse_items(raw_items, _extract_core_subject(topic))
-            for item in parsed:
-                vid = item.get("video_id", "")
-                if vid and vid not in seen_ids:
-                    seen_ids.add(vid)
-                    items.append(item)
+    try:
+        # Step 0a: Hashtag search (high-signal, runs first)
+        if hashtags and token:
+            for hashtag in hashtags:
+                raw_items = _hashtag_search(hashtag, token, deadline=deadline, cancel=cancel)
+                parsed = _parse_items(raw_items, core_topic)
+                for item in parsed:
+                    vid = item.get("video_id", "")
+                    if vid and vid not in seen_ids:
+                        seen_ids.add(vid)
+                        items.append(item)
 
-    # Step 0b: Creator profile videos (high-signal)
-    if creators and token:
-        for creator in creators:
-            raw_items = _profile_videos(creator, token)
-            parsed = _parse_items(raw_items, _extract_core_subject(topic))
-            for item in parsed:
-                vid = item.get("video_id", "")
-                if vid and vid not in seen_ids:
-                    seen_ids.add(vid)
-                    items.append(item)
+        # Step 0b: Creator profile videos (high-signal)
+        if creators and token:
+            for creator in creators:
+                raw_items = _profile_videos(creator, token, deadline=deadline, cancel=cancel)
+                parsed = _parse_items(raw_items, core_topic)
+                for item in parsed:
+                    vid = item.get("video_id", "")
+                    if vid and vid not in seen_ids:
+                        seen_ids.add(vid)
+                        items.append(item)
 
-    # Step 1: Multi-query keyword search — run ScrapeCreators for each expanded query
-    if token:
-        queries = expand_tiktok_queries(topic, depth)
-        for q in queries:
-            search_result = search_tiktok(q, from_date, to_date, depth, token)
-            if search_result.get("error"):
-                last_error = search_result["error"]
-            for item in search_result.get("items", []):
-                vid = item.get("video_id", "")
-                if vid and vid not in seen_ids:
-                    seen_ids.add(vid)
-                    items.append(item)
+        # Step 1: Multi-query keyword search — run ScrapeCreators for each expanded query
+        if token:
+            queries = expand_tiktok_queries(topic, depth)
+            for q in queries:
+                search_result = search_tiktok(
+                    q, from_date, to_date, depth, token, deadline=deadline, cancel=cancel,
+                )
+                if search_result.get("error"):
+                    last_error = search_result["error"]
+                for item in search_result.get("items", []):
+                    vid = item.get("video_id", "")
+                    if vid and vid not in seen_ids:
+                        seen_ids.add(vid)
+                        items.append(item)
+    except http.DeadlineExceeded:
+        last_error = BUDGET_ERROR
 
     # Sort merged results by views descending
     items.sort(key=lambda x: x.get("engagement", {}).get("views") or 0, reverse=True)
 
+    # OSS fallback (local): web discovery + yt-dlp when the key is missing or
+    # credits are exhausted. OSS backends do not share the ScrapeCreators
+    # deadline, so they still run after a budget stop.
     from_oss = False
     if not items and (not token or shortform_oss.credits_exhausted(last_error)):
         cfg = config
@@ -479,15 +540,13 @@ def search_and_enrich(
     if not items:
         return {"items": [], "error": last_error}
 
-    if not from_oss:
-        # Step 2: Fetch captions for top N (SC credits). OSS items already carry
-        # caption_snippet from the video description.
-        captions = fetch_captions(items, token, depth)
-        for item in items:
-            vid = item["video_id"]
-            caption = captions.get(vid)
-            if caption:
-                item["caption_snippet"] = caption
+    # Attach captions as they arrive so a later timeout cannot discard them.
+    # OSS items already carry caption_snippet from the video description.
+    if not from_oss and last_error != BUDGET_ERROR:
+        try:
+            fetch_captions(items, token, depth, deadline=deadline, cancel=cancel)
+        except http.DeadlineExceeded:
+            last_error = BUDGET_ERROR
 
     return {"items": items, "error": last_error}
 
@@ -512,6 +571,9 @@ def enrich_with_comments(
     token: str,
     max_posts: int = 3,
     max_comments: int = 5,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> List[Dict[str, Any]]:
     """Enrich top TikTok posts with comment data from ScrapeCreators.
 
@@ -527,10 +589,12 @@ def enrich_with_comments(
 
     Returns:
         Items list (mutated in place) with top_comments added to enriched items.
+        Raises DeadlineExceeded on a budget stop; collected comments remain attached.
     """
     if not items or not token or max_posts <= 0:
         return items
 
+    _check_budget(deadline, cancel)
     ranked = sorted(items, key=_tiktok_total_engagement, reverse=True)
     top_items = ranked[:max_posts]
     _log(f"Enriching comments for {len(top_items)} TikTok posts")
@@ -542,10 +606,14 @@ def enrich_with_comments(
         if not post_url:
             return False
         try:
-            comments = _fetch_post_comments(post_url, token, max_comments)
+            comments = _fetch_post_comments(
+                post_url, token, max_comments, deadline=deadline, cancel=cancel,
+            )
             if comments:
                 item["top_comments"] = comments
                 return True
+        except http.DeadlineExceeded:
+            raise
         except Exception as exc:
             _log(f"Comment enrichment failed for {post_url}: {exc}")
         return False
@@ -565,6 +633,9 @@ def _fetch_post_comments(
     post_url: str,
     token: str,
     max_comments: int = 5,
+    *,
+    deadline: float | None = None,
+    cancel: threading.Event | None = None,
 ) -> List[Dict[str, Any]]:
     """Fetch comments for a single TikTok post via ScrapeCreators.
 
@@ -578,8 +649,9 @@ def _fetch_post_comments(
 
     Returns:
         List of comment dicts with author, text, digg_count (likes), date.
-        Empty list on any error — comment failures never crash the pipeline.
+        Empty list on provider errors; DeadlineExceeded propagates to the lane.
     """
+    _check_budget(deadline, cancel)
     try:
         data = http.get(
             f"{SCRAPECREATORS_BASE}/video/comments",
@@ -587,7 +659,11 @@ def _fetch_post_comments(
             headers=http.scrapecreators_headers(token),
             timeout=30,
             retries=2,
+            deadline_monotonic=deadline,
+            cancel=cancel,
         )
+    except http.DeadlineExceeded:
+        raise
     except Exception as exc:
         _log(f"Comment fetch error for {post_url}: {exc}")
         return []

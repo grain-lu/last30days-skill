@@ -1,7 +1,16 @@
 """Date utilities for last30days skill."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple
+
+
+def x_date_filters(from_date: str, to_date: str) -> str:
+    """Translate an inclusive research window to X search operators."""
+    filters = f"since:{from_date}"
+    end = date.fromisoformat(to_date)
+    if end != date.max:
+        filters += f" until:{(end + timedelta(days=1)).isoformat()}"
+    return filters
 
 
 def parse_as_of_date(as_of_date: Optional[str]) -> Optional[str]:
@@ -53,6 +62,20 @@ def get_date_range(days: int = 30, as_of_date: Optional[str] = None) -> Tuple[st
 
     from_date = to_date - timedelta(days=days)
     return from_date.isoformat(), to_date.isoformat()
+
+
+def format_window(from_date: str, to_date: str) -> str:
+    """Render an ISO date window for readers, e.g. ``Oct 11 to Nov 10, 2026``.
+
+    The year is printed once when both dates share it and on both dates when
+    the window crosses a year boundary.
+    """
+    start = date.fromisoformat(from_date)
+    end = date.fromisoformat(to_date)
+    start_text = f"{start:%b} {start.day}"
+    if start.year != end.year:
+        start_text += f", {start.year}"
+    return f"{start_text} to {end:%b} {end.day}, {end.year}"
 
 
 def parse_date(date_str: Optional[str]) -> Optional[datetime]:
