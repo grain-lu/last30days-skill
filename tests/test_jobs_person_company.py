@@ -67,7 +67,11 @@ def test_board_named_on_the_jobs_page_the_official_careers_page_links_to_is_foun
         items, artifact = jobs.search_jobs(
             "Nvidia", WINDOW, {}, web_backend="none", site="https://www.nvidia.com/",
         )
-    assert fetched == ["https://www.nvidia.com/careers", "https://jobs.nvidia.com/careers"]
+    # The board's tenant robots.txt is asked for the tenant's other career sites.
+    assert fetched == [
+        "https://www.nvidia.com/careers", "https://jobs.nvidia.com/careers",
+        "https://nvidia.wd5.myworkdayjobs.com/robots.txt",
+    ]
     assert len(items) == 6
     assert artifact["tier"] == "ats"
     assert artifact["provider"] == "workday"
@@ -163,16 +167,14 @@ def test_wikidata_company_is_searched_alone():
     assert names == ["Nvidia"]
 
 
-def test_jobs_company_takes_the_one_host_ticker_name_only_when_wikidata_named_none():
+def test_jobs_company_takes_the_host_ticker_names_only_when_wikidata_named_none():
     one = yahoo_finance.parse_host_tickers("NVDA:Nvidia")
-    assert cli._company_for_jobs({}, one, "Jensen Huang") == {"host_company": "Nvidia"}
+    assert cli._company_for_jobs({}, one, "Jensen Huang") == {"host_companies": ["Nvidia"]}
     resolved = {"company": "Nvidia", "company_site": "https://www.nvidia.com/"}
     assert cli._company_for_jobs(resolved, one, "Jensen Huang") == resolved
     # The topic is the company: its own name is already what is searched.
     assert cli._company_for_jobs({}, one, "Nvidia") == {}
-    # Two companies, or an unusable pair, name no one company.
-    two = yahoo_finance.parse_host_tickers("TSLA:Tesla,SPCX:SpaceX")
-    assert cli._company_for_jobs({}, two, "Elon Musk") == {}
+    # An unusable pair names no company.
     assert cli._company_for_jobs({}, yahoo_finance.parse_host_tickers("NVDA"), "Jensen Huang") == {}
     assert cli._company_for_jobs({}, None, "Jensen Huang") == {}
 
@@ -267,12 +269,18 @@ def test_host_that_does_not_resolve_is_asked_for_one_page_only():
     assert not [url for url in asked if url.endswith("/jobs") and "kanyewest" in url]
 
 
-def test_careers_host_that_times_out_is_still_reported():
+def test_guessed_careers_host_that_times_out_is_no_board_found():
+    # "Sundar Pichai" on 2026-11-10: sundarpichai.com and sundarpichai.ai never
+    # answered, and the run printed "Jobs timeout: URL Error: timed out". A
+    # domain guessed from a name that does not answer is no site of the
+    # topic's, not an outage of the lane. See tests/test_jobs_reliability.py.
     def timed_out():
         raise urllib.error.URLError(TimeoutError("timed out"))
 
-    _result, failures = _search_capturing(_open_by_host(timed_out))
-    assert failures and all(f.outcome_state == http.health.TIMEOUT for f in failures)
+    (items, artifact), failures = _search_capturing(_open_by_host(timed_out))
+    assert items == []
+    assert failures == []
+    assert "_source_outcome" not in artifact
 
 
 def test_outage_of_a_known_hiring_system_is_still_an_error():
@@ -357,3 +365,106 @@ def test_jobs_page_linked_from_the_official_site_that_does_not_resolve_is_record
 
     _result, failures = _search_official(opener)
     assert [f for f in failures if f.no_host]
+
+
+# --- A known site that drops the connection on one host form ---------------------
+
+
+def _dropped(*_args, **_kwargs):
+    from http.client import RemoteDisconnected
+
+    raise RemoteDisconnected("Remote end closed connection without response")
+
+
+def _html(text):
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    response.read.return_value = text.encode("utf-8")
+    response.status = 200
+    response.headers = {}
+    return response
+
+
+def _by_host(asked, answers):
+    """Answer each request from ``answers`` keyed by host, else 404."""
+    def opener(req, timeout=None, **_kwargs):
+        asked.append(req.full_url)
+        host = req.full_url.split("/")[2]
+        if host in answers:
+            return answers[host](req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+    return opener
+
+
+def _unreachable(failures):
+    return [f for f in failures if f.outcome_state == http.health.UNREACHABLE]
+
+
+def test_known_bare_site_that_drops_the_connection_is_read_on_its_www_form():
+    asked = []
+    landing = "<h2>Join our team</h2>"
+    opener = _by_host(asked, {
+        "acmecorp.com": _dropped,
+        "www.acmecorp.com": lambda url: _html(landing) if url.endswith("/careers") else _dropped(),
+    })
+    with patch.object(http, "_open_request", side_effect=opener), \
+            patch.object(http.time, "sleep"), \
+            http.capture_failures() as failures:
+        jobs.search_jobs("Acme", WINDOW, {}, web_backend="none", site="https://acmecorp.com/")
+    assert asked[:2] == ["https://acmecorp.com/careers", "https://www.acmecorp.com/careers"]
+    assert _unreachable(failures) == []
+
+
+def test_known_site_whose_both_forms_drop_the_connection_is_one_outage():
+    asked = []
+    opener = _by_host(asked, {"acmecorp.com": _dropped, "www.acmecorp.com": _dropped})
+    with patch.object(http, "_open_request", side_effect=opener), \
+            patch.object(http.time, "sleep"), \
+            http.capture_failures() as failures:
+        jobs.search_jobs("Acme", WINDOW, {}, web_backend="none", site="https://acmecorp.com/")
+    assert [url for url in asked if url.split("/")[2] in ("acmecorp.com", "www.acmecorp.com")] == [
+        "https://acmecorp.com/careers", "https://www.acmecorp.com/careers",
+    ]
+    assert len(_unreachable(failures)) == 1
+
+
+def test_known_site_whose_other_form_answers_404_is_asked_its_jobs_page_there():
+    asked = []
+
+    def www(url):
+        if url.endswith("/jobs"):
+            return _html("<h2>Join our team</h2>")
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    opener = _by_host(asked, {"acmecorp.com": _dropped, "www.acmecorp.com": www})
+    with patch.object(http, "_open_request", side_effect=opener), \
+            patch.object(http.time, "sleep"):
+        jobs.search_jobs("Acme", WINDOW, {}, web_backend="none", site="https://acmecorp.com/")
+    assert asked[:3] == [
+        "https://acmecorp.com/careers", "https://www.acmecorp.com/careers",
+        "https://www.acmecorp.com/jobs",
+    ]
+
+
+def test_a_guessed_domain_on_the_unreadable_list_gets_no_request():
+    asked = []
+    _search_capturing(_by_host(asked, {}), company="Tesla")
+    assert asked and not [url for url in asked if url.split("/")[2] in ("tesla.com", "www.tesla.com")]
+
+
+def test_guessed_domain_that_drops_the_connection_is_not_retried_on_another_form():
+    asked = []
+    opener = _by_host(asked, {"kanyewest.com": _dropped})
+    _search_capturing(opener)
+    assert not [url for url in asked if "www.kanyewest" in url]
+
+
+def test_known_site_that_answers_404_is_not_retried_on_another_form():
+    asked = []
+    opener = _by_host(asked, {})
+    with patch.object(http, "_open_request", side_effect=opener), \
+            patch.object(http.time, "sleep"):
+        jobs.search_jobs("Acme", WINDOW, {}, web_backend="none", site="https://acmecorp.com/")
+    assert "https://acmecorp.com/careers" in asked
+    assert not [url for url in asked if "www.acmecorp.com" in url]

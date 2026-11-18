@@ -2,6 +2,8 @@
 
 Read for explicit comparison intent before engine execution and synthesis. The root output laws define the comparison exceptions.
 
+Comparison execution uses the local engine only. Follow the research runbook's backend diagnosis first. If it selects the hosted API, ask whether to run locally and wait for the user's choice before resolving entities, planning, or submitting research.
+
 ## If QUERY_TYPE = COMPARISON
 
 When the user asks "X vs Y" (or "X vs Y vs Z"), the engine fans out N full `pipeline.run()` calls in parallel — one per entity. This restored the old N-pass architecture (reverted the one-pass latency optimization that removed per-entity depth); parallel execution keeps wall clock ≈ a single pass.
@@ -35,10 +37,13 @@ if [ ! -f "$SKILL_DIR/scripts/last30days.py" ]; then
   exit 1
 fi
 
-COMPARISON_TOPIC=$(cat <<'TOPIC_EOF'
+# Keep the quoted heredoc outside command substitution: macOS Bash 3.2
+# can misparse apostrophes/backticks in a heredoc nested inside $(...).
+IFS= read -r -d '' COMPARISON_TOPIC <<'TOPIC_EOF' || true
 {TOPIC_A} vs {TOPIC_B} vs {TOPIC_C}
 TOPIC_EOF
-)
+# read reaches EOF without a NUL delimiter; drop the heredoc's final newline.
+COMPARISON_TOPIC=${COMPARISON_TOPIC%$'\n'}
 TOPIC_A_HANDLE=$(cat <<'HANDLE_EOF'
 {TOPIC_A_HANDLE}
 HANDLE_EOF
@@ -64,7 +69,7 @@ trap 'rm -f -- "$COMPETITORS_PLAN_FILE"' EXIT
 cat >| "$COMPETITORS_PLAN_FILE" <<'PLAN_EOF'
 {COMPETITORS_PLAN_JSON}
 PLAN_EOF
-"${LAST30DAYS_PYTHON}" -m json.tool "$COMPETITORS_PLAN_FILE" >/dev/null || exit 2
+"${LAST30DAYS_PYTHON}" -I -m json.tool "$COMPETITORS_PLAN_FILE" >/dev/null || exit 2
 
 "${LAST30DAYS_PYTHON}" "${SKILL_DIR}/scripts/last30days.py" "$COMPARISON_TOPIC" \
   --emit=compact \
@@ -88,10 +93,13 @@ On a Grok Bot with the official X connector, follow `grok-bot-x.md` to fetch and
 
 ```bash
 (
-COMPARISON_TOPIC=$(cat <<'TOPIC_EOF'
+# Keep the quoted heredoc outside command substitution: macOS Bash 3.2
+# can misparse apostrophes/backticks in a heredoc nested inside $(...).
+IFS= read -r -d '' COMPARISON_TOPIC <<'TOPIC_EOF' || true
 {TOPIC_A} vs {TOPIC_B} vs {TOPIC_C}
 TOPIC_EOF
-)
+# read reaches EOF without a NUL delimiter; drop the heredoc's final newline.
+COMPARISON_TOPIC=${COMPARISON_TOPIC%$'\n'}
 MAIN_TARGETING=()
 COMPETITORS_PLAN_ARGS=()
 if [ "${LAST30DAYS_HOST:-}" = "grok-bot" ] && [ "${LAST30DAYS_X_HOST_LANE:-}" = "1" ]; then
@@ -110,7 +118,7 @@ RELATED_EOF
   cat >| "$COMPETITORS_PLAN_FILE" <<'PLAN_EOF'
 {COMPETITORS_PLAN_JSON}
 PLAN_EOF
-  "${LAST30DAYS_PYTHON}" -m json.tool "$COMPETITORS_PLAN_FILE" >/dev/null || exit 2
+  "${LAST30DAYS_PYTHON}" -I -m json.tool "$COMPETITORS_PLAN_FILE" >/dev/null || exit 2
   COMPETITORS_PLAN_ARGS=(--competitors-plan "$COMPETITORS_PLAN_FILE")
 fi
 "${LAST30DAYS_PYTHON}" "${SKILL_DIR}/scripts/last30days.py" "$COMPARISON_TOPIC" \
@@ -220,7 +228,7 @@ I've compared {TOPIC_A} vs {TOPIC_B} [vs ...] using the latest community data. S
 - [follow-up on the emerging-stack combination pattern]
 ````
 
-**On Claude Code** (`CLAUDECODE` set), `references/synthesis.md` NO MARKDOWN LISTS applies here too: write the Strengths, Weaknesses, and follow-up bullets as `• ` lines, not `- ` lists.
+**On Claude Code** (`CLAUDECODE` set), `references/synthesis.md` NO MARKDOWN LISTS applies here too: follow the checklist's list line, and without one write the Strengths, Weaknesses, and follow-up bullets as `• ` lines, each but the last ending in `\`, not `- ` lists.
 
 **Do NOT:**
 - Use `What I learned:` prose label (that is general-query voice)

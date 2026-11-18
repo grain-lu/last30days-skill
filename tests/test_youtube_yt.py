@@ -765,6 +765,51 @@ class TestTranscriptFetchStats(unittest.TestCase):
         self.assertEqual(stats["attempts"], 4)
         self.assertEqual(stats["failures"], 0)
 
+    def test_fetch_stats_record_the_transcript_target_and_no_block(self):
+        items = [self._make_item(f"v{i}", 1_000 * (i + 1), "2026-03-15") for i in range(8)]
+
+        self._run(items)
+
+        stats = youtube_yt.get_transcript_fetch_stats()
+        self.assertEqual(stats["target"], youtube_yt.TRANSCRIPT_LIMITS["default"])
+        self.assertEqual(stats["blocked"], 0)
+
+    def test_fetch_stats_record_a_bot_check(self):
+        items = [self._make_item(f"v{i}", 1_000 * (i + 1), "2026-03-15") for i in range(4)]
+
+        def fake_parallel(video_ids, max_workers=5, out_captions_disabled=None, token=None, **_kwargs):
+            youtube_yt._note_youtube_block("ERROR: Sign in to confirm you're not a bot")
+            return {vid: None for vid in video_ids}
+
+        self._run(items, fake_parallel)
+
+        stats = youtube_yt.get_transcript_fetch_stats()
+        self.assertEqual(stats["blocked"], 1)
+        self.assertEqual(stats["failures"], stats["attempts"])
+
+    def test_fetch_stats_count_scrapecreators_rescues(self):
+        def fake_fetch(vid, temp_dir, status, token, rescue_budget=None):
+            if vid == "rescued":
+                status["sc_rescued"] = True
+            return "A transcript."
+
+        with mock.patch.object(youtube_yt, "fetch_transcript", side_effect=fake_fetch):
+            youtube_yt.fetch_transcripts_parallel(["rescued", "plain"], token="sc-dummy")
+
+        self.assertEqual(youtube_yt.get_transcript_fetch_stats()["sc_rescued"], 1)
+
+    def test_quality_results_pass_the_new_stats_through(self):
+        import last30days
+        report = mock.Mock()
+        report.items_by_source = {}
+        report.source_status = {}
+        report.errors_by_source = {}
+        stats = {"attempts": 6, "failures": 4, "target": 2, "blocked": 1, "sc_rescued": 2}
+        results = last30days._quality_research_results(report, {}, stats)
+        self.assertEqual(results["youtube_transcript_target"], 2)
+        self.assertEqual(results["youtube_bot_checked"], 1)
+        self.assertEqual(results["youtube_sc_rescued"], 2)
+
 
 class TestYtdlpSSHRouting(unittest.TestCase):
     """LAST30DAYS_YOUTUBE_SSH_HOST routes yt-dlp invocations through SSH for residential IP."""
@@ -2288,6 +2333,48 @@ class TestYouTubeDateWindowByFreshnessMode(unittest.TestCase):
             ["2026-10-20", "2026-11-01", "2026-12-01", "2017-03-01", self.TO], "evergreen_ok",
         )
         self.assertEqual({i["video_id"] for i in out["items"]}, {"s3", "s4"})
+
+    def test_sc_search_reads_documented_response_shape(self):
+        # Shape of a /v1/youtube/search video per docs.scrapecreators.com:
+        # camelCase counts/dates and `channel` as an object.
+        def video(vid, published, views):
+            return {
+                "type": "video",
+                "id": vid,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "title": f"Ghostty terminal review {vid}",
+                "thumbnail": "https://i.ytimg.com/vi/x/hqdefault.jpg",
+                "channel": {
+                    "id": "UCx", "title": "Terminal Weekly",
+                    "handle": "@terminalweekly", "thumbnail": "https://yt3.ggpht.com/x",
+                },
+                "viewCountText": f"{views:,} views",
+                "viewCountInt": views,
+                "publishedTimeText": "3 weeks ago",
+                "publishedTime": published,
+                "lengthText": "4:14",
+                "lengthSeconds": 254,
+            }
+
+        raw = [
+            video("in1", "2026-09-20T17:08:46.499Z", 14860),
+            video("in2", "2026-10-05T09:00:00.000Z", 462705),
+            video("old", "2017-03-01T12:00:00.000Z", 999999),
+        ]
+        with mock.patch.object(youtube_yt, "_sc_youtube_search", return_value=raw), \
+             mock.patch.object(youtube_yt, "_sc_fetch_transcript", return_value="transcript"):
+            out = youtube_yt.search_youtube_sc(
+                "Ghostty terminal", self.FROM, self.TO, token="dummy-key",
+                freshness_mode="balanced_recent",
+            )
+
+        items = out["items"]
+        self.assertEqual([i["video_id"] for i in items], ["in2", "in1"])
+        by_id = {i["video_id"]: i for i in items}
+        self.assertEqual(by_id["in1"]["date"], "2026-09-20")
+        self.assertEqual(by_id["in2"]["engagement"]["views"], 462705)
+        self.assertEqual(by_id["in1"]["channel_name"], "Terminal Weekly")
+        self.assertEqual(by_id["in1"]["duration"], 254)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import io
 import json
 import sys
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pytest
@@ -335,6 +335,142 @@ def remote_env(monkeypatch):
     monkeypatch.setattr(hosted.time, "sleep", lambda _s: None)
 
 
+@pytest.mark.parametrize(
+    ("flags", "reported_flag"),
+    [
+        (["--days=30"], "--days"),
+        (["--lookback-days=7"], "--lookback-days"),
+        (["--as-of=2026-05-13"], "--as-of"),
+        (["--search=reddit"], "--search"),
+        (["--hiring-signals"], "--hiring-signals"),
+        (["--company=Widget Co"], "--company"),
+        (["--ticker=WDGT:Widget Co"], "--ticker"),
+        (["--jobs-board=https://jobs.example.test/widget"], "--jobs-board"),
+        (["--x-handle=widget"], "--x-handle"),
+        (["--plan", json.dumps(schema.to_dict(make_report("widget").query_plan))], "--plan"),
+        (["--competitors"], "--competitors"),
+        (["--competitors-list=Peer A,Peer B"], "--competitors-list"),
+        (["--competitors-plan", "{}"], "--competitors-plan"),
+        (["--emit=html"], "--emit=html"),
+        (["--x-handle=widget", "--search=reddit"], "--x-handle, --search"),
+    ],
+)
+def test_hosted_cli_rejects_unapplied_options_before_submitting(
+    remote_env, monkeypatch, flags, reported_flag,
+):
+    post = mock.Mock(return_value=SUBMIT_OK)
+    get = mock.Mock(return_value=POLL_COMPLETE)
+    monkeypatch.setattr(cli.env, "get_config", lambda **kwargs: {})
+    monkeypatch.setattr(hosted.http, "post", post)
+    monkeypatch.setattr(hosted.http, "get", get)
+
+    rc, out, err = run_main(["widget", *flags])
+
+    post.assert_not_called()
+    get.assert_not_called()
+    assert rc == 2
+    assert out == ""
+    assert reported_flag in err
+    assert "hosted backend" in err
+
+
+@pytest.mark.parametrize("form", [("--as-of=2026-11-13",), ("--as-of", "2026-11-14")])
+def test_hosted_cli_rejects_explicit_today_before_submitting(remote_env, monkeypatch, form):
+    local_now = datetime(2026, 11, 13, 17, tzinfo=timezone(timedelta(hours=-8)))
+    monkeypatch.setattr(cli.dates, "_local_now", lambda: local_now)
+    monkeypatch.setattr(cli.env, "get_config", lambda **kwargs: {})
+    post = mock.Mock(return_value=SUBMIT_OK)
+    monkeypatch.setattr(hosted.http, "post", post)
+    monkeypatch.setattr(hosted.http, "get", mock.Mock(return_value=POLL_COMPLETE))
+
+    rc, out, err = run_main(["Nvidia", *form])
+
+    post.assert_not_called()
+    assert rc == 2
+    assert out == ""
+    assert "--as-of" in err
+    assert "hosted backend" in err
+
+
+@pytest.mark.parametrize("topic", ["Nvidia vs AMD", "Nvidia compared to AMD"])
+def test_hosted_cli_rejects_comparison_before_submitting(remote_env, monkeypatch, topic):
+    monkeypatch.setattr(cli.env, "get_config", lambda **kwargs: {})
+    post = mock.Mock(return_value=SUBMIT_OK)
+    monkeypatch.setattr(hosted.http, "post", post)
+    monkeypatch.setattr(hosted.http, "get", mock.Mock(return_value=POLL_COMPLETE))
+
+    rc, out, err = run_main([topic])
+
+    post.assert_not_called()
+    assert rc == 2
+    assert out == ""
+    assert "hosted backend cannot run comparisons" in err
+    assert "Run locally" in err
+
+
+def test_hosted_cli_submits_supported_query_once(remote_env, monkeypatch, tmp_path):
+    save_dir = tmp_path / "saved"
+    post = mock.Mock(return_value=SUBMIT_OK)
+    get = mock.Mock(return_value=POLL_COMPLETE)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setattr(cli.env, "get_config", lambda **kwargs: {})
+    monkeypatch.setattr(hosted.http, "post", post)
+    monkeypatch.setattr(hosted.http, "get", get)
+
+    rc, out, _err = run_main([
+        "Nvidia", "--register=exec", "--save-dir", str(save_dir),
+    ])
+
+    assert rc == 0
+    assert "Synthesized report body." in out
+    post.assert_called_once()
+    assert post.call_args.kwargs["json_data"] == {
+        "query": "Nvidia", "depth": "default", "register": "exec",
+    }
+    get.assert_called_once()
+    assert (save_dir / "nvidia-raw.md").read_text(encoding="utf-8") == POLL_COMPLETE["raw_markdown"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "config", "backend"),
+    [
+        ([], {}, "hosted"),
+        (["--mock"], {}, "local"),
+        (["--deep-research"], {}, "local"),
+        (["--corpus=/local-notes"], {}, "local"),
+        ([], {"LAST30DAYS_CORPUS_DIRS": "/local-notes"}, "local"),
+        (["--perplexity-search-type=fast"], {}, "hosted"),
+        (["--perplexity-search-type=fast"], {"PERPLEXITY_API_KEY": "dummy-perplexity"}, "local"),
+    ],
+)
+def test_diagnose_identifies_research_backend(remote_env, monkeypatch, flags, config, backend):
+    monkeypatch.setattr(cli.env, "get_config", lambda **kwargs: dict(config))
+    monkeypatch.setattr(cli.pipeline, "diagnose", lambda *args, **kwargs: {"available_sources": []})
+    post = mock.Mock()
+    monkeypatch.setattr(hosted.http, "post", post)
+
+    rc, out, _err = run_main(["--diagnose", "--include-research-backend", *flags])
+
+    assert rc == 0
+    assert json.loads(out) == {"available_sources": [], "research_backend": backend}
+    post.assert_not_called()
+
+
+def test_include_research_backend_requires_diagnose(remote_env, monkeypatch, capsys):
+    post = mock.Mock()
+    monkeypatch.setattr(hosted.http, "post", post)
+    monkeypatch.setattr(sys, "argv", ["last30days.py", "Nvidia", "--include-research-backend"])
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert error.value.code == 2
+    assert captured.out == ""
+    assert "--include-research-backend requires --diagnose" in captured.err
+    post.assert_not_called()
+
+
 def test_happy_path_submit_poll_complete(remote_env, monkeypatch, capsys):
     posts, gets = [], []
 
@@ -429,6 +565,74 @@ def test_save_dir_uses_unique_dated_fallback(remote_env, monkeypatch, capsys, tm
     assert "# Raw markdown" in saved.read_text(encoding="utf-8")
     assert base.read_text(encoding="utf-8") == "base content"
     assert dated.read_text(encoding="utf-8") == "dated content"
+    assert f"Saved output to {saved.resolve()}" in captured.err
+    assert TEST_KEY not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Save-suffix sanitization: --save-suffix must never shape the path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected_name"),
+    [
+        pytest.param("../../evil", "test-topic-raw-evil.md", id="parent-ref"),
+        pytest.param("/var/tmp/evil", "test-topic-raw-var-tmp-evil.md", id="abs-path"),
+        pytest.param("Report V3", "test-topic-raw-report-v3.md", id="mixed-case"),
+        pytest.param("GEMINI-DEEP", "test-topic-raw-gemini-deep.md", id="upper"),
+        pytest.param("", "test-topic-raw.md", id="empty"),
+        pytest.param("...?!..", "test-topic-raw.md", id="punct-only-drops"),
+        pytest.param("-edge-", "test-topic-raw-edge.md", id="edge-hyphens"),
+    ],
+)
+def test_save_suffix_sanitized_stays_in_save_dir(
+    remote_env, monkeypatch, capsys, tmp_path, suffix, expected_name
+):
+    """Whatever --save-suffix holds, the saved file lands directly under the
+    requested save dir with a [a-z0-9-] suffix token (or none at all)."""
+    monkeypatch.setattr(hosted.http, "post", lambda *a, **k: dict(SUBMIT_OK))
+    monkeypatch.setattr(hosted.http, "get", lambda *a, **k: dict(POLL_COMPLETE))
+
+    rc = hosted.run_hosted("Test Topic!", "default", emit="compact",
+                           save_dir=str(tmp_path), save_suffix=suffix)
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert [saved_path.name for saved_path in tmp_path.iterdir()] == [expected_name]
+    saved = tmp_path / expected_name
+    # Directly under the requested save directory - no separators, no `..`.
+    assert saved.is_file()
+    assert saved.resolve().parent == tmp_path.resolve()
+    assert "# Raw markdown" in saved.read_text(encoding="utf-8")
+    assert f"Saved output to {saved.resolve()}" in captured.err
+    assert TEST_KEY not in captured.err
+
+
+def test_save_suffix_collision_falls_back_to_dated_sanitized_name(
+    remote_env, monkeypatch, capsys, tmp_path
+):
+    """Collision fallback still applies once the suffix is sanitized: hostile
+    '../Report V3' -> '-report-v3', and pre-existing files keep their content."""
+    monkeypatch.setattr(hosted.http, "post", lambda *a, **k: dict(SUBMIT_OK))
+    monkeypatch.setattr(hosted.http, "get", lambda *a, **k: dict(POLL_COMPLETE))
+    today = datetime.now().strftime("%Y-%m-%d")
+    base = tmp_path / "test-topic-raw-report-v3.md"
+    dated = tmp_path / f"test-topic-raw-report-v3-{today}.md"
+    base.write_text("prior base", encoding="utf-8")
+    dated.write_text("prior dated", encoding="utf-8")
+
+    rc = hosted.run_hosted("Test Topic!", "default", emit="compact",
+                           save_dir=str(tmp_path), save_suffix="../Report V3")
+    captured = capsys.readouterr()
+
+    saved = tmp_path / f"test-topic-raw-report-v3-{today}-1.md"
+    assert rc == 0
+    assert saved.exists()
+    assert saved.resolve().parent == tmp_path.resolve()
+    assert "# Raw markdown" in saved.read_text(encoding="utf-8")
+    assert base.read_text(encoding="utf-8") == "prior base"
+    assert dated.read_text(encoding="utf-8") == "prior dated"
     assert f"Saved output to {saved.resolve()}" in captured.err
     assert TEST_KEY not in captured.err
 
