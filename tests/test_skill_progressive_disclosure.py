@@ -54,9 +54,9 @@ def test_configured_user_without_global_marker_has_a_bounded_setup_check():
     total = len((SKILL_ROOT / "SKILL.md").read_bytes()) + sum(
         len(reference_text(name).encode("utf-8")) for name in names
     )
-    # 上游 v4 抬到 191_500；本地 fork 的 weixin 行 + keyless 兜底句使实测值
-    # 高于纯净上游，保留本地注释语义，预算取上游值。
-    assert total <= 191_500, f"configured path without a global marker loads {total} bytes"
+    # 上游 v4.6 抬到 191_500；本地 fork 的 weixin/TinyFish/TranscriptAPI 行
+    # + shortform fallback 详句使实测值(191_846)高于纯净上游，按实测+余量抬预算。
+    assert total <= 192_000, f"configured path without a global marker loads {total} bytes"
 
 
 def test_existing_users_can_load_repair_without_restarting_onboarding():

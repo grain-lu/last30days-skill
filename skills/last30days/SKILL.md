@@ -25,6 +25,7 @@ metadata:
         - PARALLEL_API_KEY
         - BRAVE_API_KEY
         - TINYFISH_API_KEY
+        - APIFY_API_TOKEN
         - AUTH_TOKEN
         - CT0
         - BSKY_HANDLE
