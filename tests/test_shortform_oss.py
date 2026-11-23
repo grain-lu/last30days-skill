@@ -30,6 +30,7 @@ from tests.test_doctor import _build
 # Each of these alone must be enough to arm the fallback.
 DISCOVERY_BACKENDS = [
     {"LAST30DAYS_SEARXNG_URL": "https://searx.example"},
+    {"TINYFISH_API_KEY": "tf"},
     {"SERPER_API_KEY": "sp"},
     {"EXA_API_KEY": "ex"},
     {"BRAVE_API_KEY": "br"},
@@ -86,10 +87,10 @@ class TestShortformGate:
         assert env.shortform_discovery_sources(cfg, "instagram") == ["host search"]
 
     def test_discovery_sources_list_every_armed_rung_in_lane_order(self):
-        cfg = {"LAST30DAYS_SEARXNG_URL": "https://searx.example", "SERPER_API_KEY": "sp",
-               "EXA_API_KEY": "ex", "BRAVE_API_KEY": "br"}
+        cfg = {"LAST30DAYS_SEARXNG_URL": "https://searx.example", "TINYFISH_API_KEY": "tf",
+               "SERPER_API_KEY": "sp", "EXA_API_KEY": "ex", "BRAVE_API_KEY": "br"}
         assert env.shortform_discovery_sources(cfg, "tiktok") == [
-            "SearXNG", "Serper", "Exa", "Brave", "keyless floor",
+            "SearXNG", "TinyFish", "Serper", "Exa", "Brave", "keyless floor",
         ]
 
 

@@ -2193,6 +2193,9 @@ def shortform_discovery_sources(
     armed: list[str] = []
     if (cfg.get('LAST30DAYS_SEARXNG_URL') or '').strip():
         armed.append("SearXNG")
+    if cfg.get('TINYFISH_API_KEY'):
+        # Local addition: include_domains-capable search, tried before Serper.
+        armed.append("TinyFish")
     if cfg.get('SERPER_API_KEY'):
         armed.append("Serper")
     if kind == 'tiktok' and cfg.get('EXA_API_KEY'):

@@ -217,6 +217,23 @@ def _collect(kind: str, raw_urls, dest: List[str], limit: int) -> bool:
     return False
 
 
+def _tinyfish_links(query: str, api_key: str, domain: str, count: int) -> List[str]:
+    """TinyFish Search REST. include_domains works; Serper free-tier ``site:`` does not."""
+    data = http.request(
+        "GET",
+        "https://api.search.tinyfish.ai",
+        headers={"X-API-Key": api_key, "Accept": "application/json"},
+        params={
+            "query": query,
+            "include_domains": domain,
+            "purpose": "Find public short-form video post URLs for metadata extraction",
+        },
+        timeout=20,
+        retries=1,
+    )
+    return [r.get("url", "") for r in (data.get("results") or []) if isinstance(r, dict)][: max(count * 2, count)]
+
+
 def _serper_links(
     query: str, api_key: str, count: int, deadline: float | None = None,
     fresh: bool = False, cancel: threading.Event | None = None,
@@ -321,6 +338,23 @@ def discover_urls(
                 used = "searxng"
         except Exception as e:
             _log(kind, f"SearXNG discovery error: {e}")
+
+    # TinyFish (local addition): include_domains works where Serper free-tier
+    # ``site:`` does not, so it runs before the other paid rungs.
+    if not urls and not _stopped(deadline, cancel) and config.get("TINYFISH_API_KEY"):
+        domain = "tiktok.com" if kind == "tiktok" else "instagram.com"
+        try:
+            if _collect(
+                kind,
+                _tinyfish_links(q, config["TINYFISH_API_KEY"], domain, count),
+                urls,
+                count,
+            ):
+                return urls, "tinyfish"
+            if urls:
+                used = "tinyfish"
+        except Exception as e:
+            _log(kind, f"TinyFish discovery error: {e}")
 
     # Serper/Exa/Brave are paid rungs here, not the first choice: Serper's
     # free tier rejects ``site:`` filters, Exa returns 0 Instagram posts, and
