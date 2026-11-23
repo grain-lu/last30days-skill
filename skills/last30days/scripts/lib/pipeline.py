@@ -31,6 +31,7 @@ from . import (
     corpus,
     dates,
     dedupe,
+    deepline,
     devto,
     digg,
     dripstack,
@@ -57,6 +58,7 @@ from . import (
     normalize,
     permission_preflight,
     perplexity,
+    person,
     pinterest,
     planner,
     polymarket,
@@ -72,6 +74,8 @@ from . import (
     relevance,
     rerank,
     schema,
+    shortform_envelope,
+    shortform_oss,
     signals,
     snippet,
     stocktwits,
@@ -414,6 +418,17 @@ def _excluded_sources(config: dict[str, Any]) -> set[str]:
     }
 
 
+def with_plan_source_omissions(
+    config: dict[str, Any], plan: dict | None,
+) -> dict[str, Any]:
+    """Apply a validated plan's exclusions without changing shared configuration."""
+    omissions = (plan or {}).get("omit_sources")
+    if not omissions:
+        return config
+    excluded = _excluded_sources(config).union(omissions)
+    return {**config, "EXCLUDE_SOURCES": ",".join(sorted(excluded))}
+
+
 class NoRequestedSourceAvailable(RuntimeError):
     """None of the sources the user asked for with --search is configured."""
 
@@ -541,6 +556,10 @@ def available_sources(
         "linkedin" in include_sources or (requested_sources and "linkedin" in requested_sources)
     ):
         available.append("linkedin")
+    # The person's own LinkedIn posts: a person run only, with a profile read
+    # from an anchored URL. Never a keyword search, so no other run gets it.
+    if _person_posts_mode(config):
+        available.append(PERSON_POSTS_SOURCE)
     # Trustpilot: opt-in additive source via INCLUDE_SOURCES=trustpilot (same
     # consent pattern as Perplexity/LinkedIn). Off by default -- unlike arXiv and
     # Techmeme, which are zero-auth, it can spawn a one-time headless-Chrome WAF
@@ -2196,7 +2215,10 @@ def diagnose(
         "brightdata_authenticated": brightdata_status["brightdata_authenticated"],
         # Fresh browser session or a cached company record: the host resolves
         # a --trustpilot-domain only then. Local reads; never opens a browser.
-        "trustpilot_can_run": trustpilot.can_run_now(config)["can_run"],
+        "trustpilot_can_run": (
+            "trustpilot" not in _excluded_sources(config)
+            and trustpilot.can_run_now(config)["can_run"]
+        ),
         # safe=True (doctor/--diagnose/--preflight) must stay network-free:
         # answer X availability from local evidence only. x_pending is
         # precomputed by diagnose() to avoid double evaluation.
@@ -2351,8 +2373,13 @@ def run(
     corpus_all_time: bool = False,
     x_posts: x_envelope.Envelope | None = None,
     reddit_threads: reddit_envelope.Envelope | None = None,
+    shortform_urls: shortform_envelope.Envelope | None = None,
 ) -> schema.Report:
     _check_research(config)
+    if external_plan is not None:
+        planner.validate_external_plan(external_plan)
+        config = with_plan_source_omissions(config, external_plan)
+    excluded_sources = _excluded_sources(config)
     # ``suppress_x_host_lane`` is distinct from ``internal_subrun``: comparison
     # entities share the latter and must still honor the connector lane;
     # only discovery enrichment passes set the former.
@@ -2378,7 +2405,6 @@ def run(
         corpus_dirs or config.get("_CORPUS_DIRS"),
         config.get("LAST30DAYS_CORPUS_DIRS"),
     )
-    excluded_sources = _excluded_sources(config)
     corpus_enabled = bool(resolved_corpus_dirs) and "corpus" not in excluded_sources
     corpus_requested = bool(requested_sources and "corpus" in requested_sources)
     if corpus_enabled and requested_sources and "corpus" not in requested_sources:
@@ -2446,6 +2472,22 @@ def run(
     if reddit_refs_envelope is not None:
         config = dict(config)
         config["_reddit_envelope"] = reddit_refs_envelope
+
+    # Host-found TikTok / Instagram URLs (--shortform-urls). Only the keyless
+    # short-form lane reads them; a run searching neither platform ignores them.
+    if shortform_urls is not None and not any(
+        name not in excluded_sources
+        and (not requested_sources or name in requested_sources)
+        for name in ("tiktok", "instagram")
+    ):
+        log.source_log(
+            "TikTok", "host short-form URLs: envelope ignored (TikTok and Instagram are excluded from this run)",
+            tty_only=False,
+        )
+        shortform_urls = None
+    if shortform_urls is not None:
+        config = dict(config)
+        config["_shortform_envelope"] = shortform_urls
 
     # Gate StockTwits to ticker/crypto topics. Single chokepoint: when False,
     # available_sources() never registers stocktwits, so the planner can't
@@ -2524,6 +2566,14 @@ def run(
                 + ". Run `last30days.py doctor` to see what each one needs."
             )
         raise RuntimeError("No sources are available for this run.")
+    # A person run's own posts are not a source the host names in --search:
+    # keep the lane whatever the list says. EXCLUDE_SOURCES still opts out.
+    if (
+        PERSON_POSTS_SOURCE in available_before_search
+        and PERSON_POSTS_SOURCE not in available
+        and PERSON_POSTS_SOURCE not in excluded_sources
+    ):
+        available.append(PERSON_POSTS_SOURCE)
 
     planner_requested_sources = (
         [source for source in requested_sources if source not in excluded_sources]
@@ -2534,8 +2584,6 @@ def run(
 
     if external_plan is not None:
         # External plan provided (e.g., from Claude Code via --plan flag).
-        # Explicit input is a contract: validate it before permissive sanitization.
-        planner.validate_external_plan(external_plan)
         if hiring_signals_mode:
             # Hiring-signals mode always runs the jobs lane. Add it before
             # sanitizing: with a jobs-only source set, sanitize would drop every
@@ -2592,6 +2640,15 @@ def run(
             plan_source = "llm"
         else:
             plan_source = "deterministic"
+
+    # A person run: the person's anchors join any the plan supplied, and the
+    # identity gate fails closed even when no anchor is known.
+    person_ctx = config.get("_person")
+    if person_ctx is not None:
+        plan.person_identity_anchors = _merged_person_anchors(
+            plan.person_identity_anchors, person_ctx.anchors,
+        )
+        plan.person_run = True
 
     _check_research(config)
     # Safety net: ensure grounding appears in all subqueries even if the planner
@@ -2699,6 +2756,10 @@ def run(
     # on one platform, and an unrelated same-name account elsewhere must not
     # bypass the floors.
     creator_first_party = _creator_first_party_by_source(tiktok_creators, ig_creators)
+    if person_ctx is not None and person_ctx.full_name:
+        # The person's own posts rarely repeat their name; scoped to the
+        # posts lane, so no same-name account elsewhere is exempted.
+        creator_first_party[PERSON_POSTS_SOURCE] = {person_ctx.full_name.lower()}
     # Real X handles: --x-handle, --x-related, or @mentions in the topic. These
     # determine whether the deferred X floor applies. Topic words like "peter"
     # are NOT real handles and should not trigger the floor — when no real
@@ -2790,6 +2851,10 @@ def run(
                     freshness_mode=plan.freshness_mode,
                     ranking_query=f"What is @{github_user} doing on GitHub?",
                 )
+                if person_ctx is not None:
+                    # Authored by the person's resolved account.
+                    for item in normalized:
+                        item.metadata["identity_anchor"] = True
                 # Use the first subquery's label so RRF can look up the weight
                 primary_label = plan.subqueries[0].label if plan.subqueries else "primary"
                 bundle.add_items(primary_label, "github", normalized)
@@ -2900,6 +2965,9 @@ def run(
                 # Skip GitHub keyword search if person-mode already ran
                 if source == "github" and (_github_person_done or _github_custom_done):
                     continue
+                # The person's posts run once, below, never per subquery.
+                if source == PERSON_POSTS_SOURCE:
+                    continue
                 if source == "jobs" and jobs_past_window:
                     bundle.source_status["jobs"] = schema.SourceOutcome(
                         source="jobs",
@@ -2984,6 +3052,29 @@ def run(
                     )
                 ] = (subquery, source)
 
+        # The person's own LinkedIn posts: one read, in the same executor and
+        # under the same deadline as every other stream.
+        person_posts_mode = _person_posts_mode(config)
+        if (
+            person_posts_mode
+            and not mock
+            and plan.subqueries
+            and PERSON_POSTS_SOURCE in available
+        ):
+            bundle.mark_attempted(PERSON_POSTS_SOURCE)
+            futures[
+                executor.submit(
+                    _fetch_person_posts,
+                    mode=person_posts_mode,
+                    profile_url=person_ctx.linkedin_url,
+                    stored_posts=list((person_ctx.profile or {}).get("posts") or []),
+                    author=person_ctx.full_name,
+                    config=stream_config,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            ] = (plan.subqueries[0], PERSON_POSTS_SOURCE)
+
         # Collect ordinary streams and any inline retries before waiting on
         # the longer background request.
         for future, subquery, source, budget_expired in _completed_streams(batches, bundle):
@@ -3050,6 +3141,10 @@ def run(
                     state, attempted = _classify_source_failure(exc)
                     bundle.record_failure(source, state, str(exc), attempted=attempted)
                     continue
+            if source == PERSON_POSTS_SOURCE and isinstance(artifact, dict):
+                artifact = dict(artifact)
+                person_ctx.older_posts = list(artifact.pop("_person_older_posts", None) or [])
+                person_ctx.posts_read = bool(artifact.pop("_person_posts_read", False))
             if isinstance(artifact, dict) and artifact.get("_source_skipped"):
                 # The lane chose not to run (jobs' past-window skip is the
                 # precedent): not attempted, so it is no failure, no degraded
@@ -3360,13 +3455,28 @@ def run(
     # Fusion gates on identity too, but the footer counts and Top voices read
     # this per-source view, so a namesake left here still reaches the report.
     # Gated after enrichment so a backfilled transcript can supply the anchor.
-    items_by_source = {
-        source: [
+    gated_items_by_source: dict[str, list[schema.SourceItem]] = {}
+    dropped_by_identity: dict[str, int] = {}
+    for source, items in items_by_source.items():
+        kept = [
             item for item in items
-            if entity_extract.matches_person_identity(item, plan.person_identity_anchors, x_handle)
+            if entity_extract.matches_person_identity(
+                item, plan.person_identity_anchors, x_handle,
+                person_run=getattr(plan, "person_run", False),
+            )
         ]
-        for source, items in items_by_source.items()
-    }
+        if len(kept) < len(items):
+            dropped_by_identity[source] = len(items) - len(kept)
+        gated_items_by_source[source] = kept
+    items_by_source = gated_items_by_source
+    if person_ctx is not None:
+        person_ctx.dropped_counts = dropped_by_identity
+        person_ctx.in_window_posts = len(items_by_source.get(PERSON_POSTS_SOURCE, []))
+        person_ctx.first_party_in_window = _first_party_in_window(
+            items_by_source, x_handle=x_handle, github_person=_github_person_done,
+            from_date=from_date, to_date=to_date,
+        )
+        bundle.artifacts["person_profile"] = person_ctx.to_dict()
     retained_markets = {
         source_item_key(item) for item in items_by_source.get("polymarket", [])
     }
@@ -4495,6 +4605,224 @@ def _jobs_board_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     return artifact
 
 
+# -- person runs ----------------------------------------------------------------
+
+# The person's own LinkedIn posts, read once per person run.
+PERSON_POSTS_SOURCE = "linkedin_profile"
+# Older posts kept for the Person Profile, and each one's text cap.
+PERSON_OLDER_POSTS_MAX = 6
+PERSON_OLDER_POST_CHARS = 300
+# How far back older posts reach.
+PERSON_POSTS_LOOKBACK_DAYS = 365
+PERSON_POSTS_PAGES = deepline.DEFAULT_CAPS[deepline.TOOL_POSTS]
+
+_PERSON_POSTS_FAILURE_STATES: dict[str, str] = {
+    deepline.AUTH_FAILED: schema.AUTH_FAILED,
+    deepline.OUT_OF_CREDITS: schema.PAYMENT_REQUIRED,
+    deepline.RATE_LIMITED: schema.RATE_LIMITED,
+    deepline.TIMEOUT: health.TIMEOUT,
+}
+
+
+def _person_posts_mode(config: dict[str, Any]) -> str | None:
+    """How this run reads the person's posts: "stored", "deepline", or None.
+
+    Only a person run whose LinkedIn profile was read from an anchored URL
+    qualifies. A ScrapeCreators profile read already returned the posts
+    ("stored"); otherwise a Deepline key reads them ("deepline").
+    """
+    ctx = config.get("_person")
+    if ctx is None or ctx.linkedin_status != person.LINKEDIN_CHECKED or not ctx.linkedin_url:
+        return None
+    profile = ctx.profile or {}
+    if profile.get("source") == "scrapecreators" and profile.get("posts"):
+        return "stored"
+    if deepline.is_available(config):
+        return "deepline"
+    return None
+
+
+def _read_person_posts(
+    profile_url: str, config: dict[str, Any], from_date: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Up to two pages of the person's posts from Deepline, and the failure that
+    ended the read before any post arrived (None when the read worked)."""
+    import uuid
+
+    client = deepline.from_config(config, uuid.uuid4().hex)
+    if client is None:
+        return [], {"state": schema.SKIPPED_UNCONFIGURED, "detail": "No Deepline key", "attempted": False}
+    cutoff = (
+        date.fromisoformat(from_date) - timedelta(days=PERSON_POSTS_LOOKBACK_DAYS)
+    ).isoformat()
+    posts: list[dict[str, Any]] = []
+    token = None
+    for _page in range(PERSON_POSTS_PAGES):
+        result = client.get_posts(
+            profile_url,
+            deadline_monotonic=config.get("_research_deadline"),
+            posted_limit="year",
+            pagination_token=token,
+        )
+        if result["status"] != deepline.OK:
+            state = _PERSON_POSTS_FAILURE_STATES.get(result["status"], "error")
+            detail = f"LinkedIn posts read failed: {result['status']}"
+            if result.get("detail"):
+                detail += f" ({result['detail']})"
+            if posts:
+                # A later page failed: keep the posts already read, but the
+                # read is incomplete, so the count is a floor, not a total.
+                return posts, {"state": state, "detail": detail, "partial": True}
+            return [], {"state": state, "detail": detail}
+        page = result["data"] or {}
+        posts.extend(page.get("posts") or [])
+        token = page.get("next_token")
+        days = [post.get("date") for post in posts if post.get("date")]
+        # A second page only helps while this one still reaches inside the
+        # year and the older-activity list is not yet full.
+        older = [day for day in days if day < from_date]
+        if not token or (days and min(days) < cutoff) or len(older) >= PERSON_OLDER_POSTS_MAX:
+            break
+    return posts, None
+
+
+def _split_person_posts(
+    posts: list[dict[str, Any]], *, author: str, from_date: str, to_date: str,
+    owner_id: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(in-window raw items, older-activity entries newest first).
+
+    Undated posts are dropped: older activity is shown by its real date, and
+    the window cannot be checked without one. The upstream's own date limit is
+    not trusted, so the year cutoff is applied here.
+    """
+    cutoff = (
+        date.fromisoformat(from_date) - timedelta(days=PERSON_POSTS_LOOKBACK_DAYS)
+    ).isoformat()
+    in_window: list[dict[str, Any]] = []
+    older: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for post in posts:
+        day = str(post.get("date") or "")
+        key = str(post.get("url") or post.get("id") or "")
+        if not day or (key and key in seen):
+            continue
+        if key:
+            seen.add(key)
+        text = str(post.get("text") or "").strip()
+        # A post another member wrote shows on the profile's activity because
+        # the person shared it; it is not their own words.
+        post_author = str(post.get("author_id") or "").lower()
+        is_reshare = bool(post.get("is_reshare")) or bool(
+            owner_id and post_author and post_author != owner_id.lower()
+        )
+        if from_date <= day <= to_date:
+            in_window.append({
+                "id": post.get("id"),
+                "url": post.get("url"),
+                "text": text,
+                "date": day,
+                "is_reshare": is_reshare,
+                "author": author,
+                "engagement": dict(post.get("engagement") or {}),
+            })
+        elif cutoff <= day < from_date:
+            if len(text) > PERSON_OLDER_POST_CHARS:
+                text = text[: PERSON_OLDER_POST_CHARS - 1].rstrip() + "\u2026"
+            older.append({"date": day, "url": post.get("url"), "text": text, "is_reshare": is_reshare})
+    older.sort(key=lambda entry: entry["date"], reverse=True)
+    return in_window, older[:PERSON_OLDER_POSTS_MAX]
+
+
+def _fetch_person_posts(
+    *,
+    mode: str,
+    profile_url: str,
+    stored_posts: list[dict[str, Any]],
+    author: str,
+    config: dict[str, Any],
+    from_date: str,
+    to_date: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The posts lane's stream result: in-window raw items, plus an artifact
+    carrying the older posts and, on failure or an empty window, the outcome.
+
+    Never raises: a failure is an outcome, and the generic transient retry
+    must not re-run this lane through the keyword-search path.
+    """
+    try:
+        if mode == "stored":
+            posts, failure = list(stored_posts), None
+        else:
+            posts, failure = _read_person_posts(profile_url, config, from_date)
+        in_window, older = _split_person_posts(
+            posts, author=author, from_date=from_date, to_date=to_date,
+            owner_id=profile_url.rstrip("/").rsplit("/", 1)[-1],
+        )
+    except Exception as exc:  # noqa: BLE001 - a lane failure is an outcome
+        return [], {
+            "_person_older_posts": [],
+            "_source_outcome": {"state": "error", "detail": f"LinkedIn posts lane failed: {type(exc).__name__}"},
+        }
+    artifact: dict[str, Any] = {"_person_older_posts": older, "_person_posts_read": failure is None}
+    if failure is not None and failure.get("partial"):
+        # The posts that arrived still count; only the total is unknown.
+        log.source_log("LinkedIn profile", f"posts read incomplete: {failure['detail']}", tty_only=False)
+    elif failure is not None:
+        artifact["_source_outcome"] = failure
+    elif not in_window:
+        # Like a pinned GitHub user with no activity: recorded, never
+        # backfilled with a keyword search for the name.
+        artifact["_source_outcome"] = {
+            "state": schema.NO_RESULTS,
+            "detail": "No LinkedIn posts by the person in the window",
+        }
+    log.source_log(
+        "LinkedIn profile",
+        f"{len(in_window)} post(s) in the window, {len(older)} older",
+        tty_only=False,
+    )
+    return in_window, artifact
+
+
+def _merged_person_anchors(plan_anchors: list[str], person_anchors: list[str]) -> list[str]:
+    """The plan's anchors followed by the person's, each once, ignoring case."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for anchor in [*plan_anchors, *person_anchors]:
+        text = " ".join(str(anchor or "").split())
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            merged.append(text)
+    return merged
+
+
+def _first_party_in_window(
+    items_by_source: dict[str, list[schema.SourceItem]],
+    *,
+    x_handle: str | None,
+    github_person: bool,
+    from_date: str,
+    to_date: str,
+) -> int:
+    """Dated in-window items from the person's own accounts: their LinkedIn
+    posts, posts by the resolved X handle, and GitHub person-mode activity."""
+
+    def in_window(item: schema.SourceItem) -> bool:
+        return bool(item.published_at) and from_date <= item.published_at[:10] <= to_date
+
+    handle = (x_handle or "").lstrip("@").lower()
+    count = sum(in_window(item) for item in items_by_source.get(PERSON_POSTS_SOURCE, []))
+    if handle:
+        count += sum(
+            in_window(item) for item in items_by_source.get("x", [])
+            if (item.author or "").lstrip("@").lower() == handle
+        )
+    if github_person:
+        count += sum(in_window(item) for item in items_by_source.get("github", []))
+    return count
+
+
 def _rejected_job_keys(
     candidates: list[schema.Candidate],
     ranked: list[schema.Candidate],
@@ -4633,30 +4961,6 @@ def _ensure_devto_in_plan(plan: schema.QueryPlan, available: list[str]) -> None:
         plan.source_weights = planner._normalize_weights(plan.source_weights)
 
 
-# Sources that are available only because the user installed their CLI or opted
-# in (INCLUDE_SOURCES, --search, a targeting flag). A host plan that names none
-# of them in any subquery almost always means the host planner never knew to
-# list them, not that it chose to skip them, so they ride the primary subquery.
-# A lane that cannot run this session (Trustpilot with no browser session or
-# cached record) is never added: the host skipped it on purpose.
-# Paid lanes with their own host decision step (amazon, meta_ads) stay out
-# unless this run asked for them (HOST_PLAN_PAID_LANES below);
-# EXCLUDE_SOURCES and --search already filter ``available``.
-HOST_PLAN_BACKFILL_SOURCES = (
-    "digg",
-    "arxiv",
-    "techmeme",
-    "bluesky",
-    "truthsocial",
-    "stocktwits",
-    "linkedin",
-    "dripstack",
-    "devto",
-    "telegram",
-    "trustpilot",
-)
-
-
 # Paid lanes the host requests per run outside the plan (runbook Step 0.5e /
 # 0.5f): source -> (config key of its targeting flag, log label). They join a
 # host plan only when this run asked: the source is in --search, or its
@@ -4713,7 +5017,7 @@ def _ensure_unplanned_lanes_in_host_plan(
     if not plan.subqueries:
         return
     planned = {source for subquery in plan.subqueries for source in subquery.sources}
-    candidates = (*(HOST_PLAN_BACKFILL_SOURCES if installed else ()), *asked)
+    candidates = (*(planner.HOST_PLAN_BACKFILL_SOURCES if installed else ()), *asked)
     missing = []
     for source in candidates:
         if source not in available or source in planned or source in missing:
@@ -4748,7 +5052,7 @@ def _ensure_unplanned_lanes_in_host_plan(
         "Planner",
         "Added installed/opted-in/requested sources absent from every --plan subquery to "
         f"{plan.subqueries[0].label}: {', '.join(missing)} "
-        "(set EXCLUDE_SOURCES to skip them).",
+        "(use EXCLUDE_SOURCES or, for optional lanes, plan omit_sources to skip them).",
         tty_only=False,
     )
 
@@ -5457,7 +5761,10 @@ def _run_supplemental_searches(
     x_dicts = [
         {"author_handle": item.author or "", "text": item.body or ""}
         for item in bundle.items_by_source.get("x", [])
-        if entity_extract.matches_person_identity(item, plan.person_identity_anchors, x_handle)
+        if entity_extract.matches_person_identity(
+            item, plan.person_identity_anchors, x_handle,
+            person_run=getattr(plan, "person_run", False),
+        )
     ]
     reddit_dicts = [
         {
@@ -6301,6 +6608,73 @@ def _detail_rate_limits_source(source: str, artifact: dict) -> bool:
         # run (reddit_health) and is a detail note, never a source skip.
         return False
     return source != "x" or not bool(artifact.get("_x_backup_not_rate_limited"))
+
+
+# TikTok videos per run that get comments from the free public endpoint (the
+# lane keeps about this many; ScrapeCreators comments cover three).
+PUBLIC_COMMENT_POSTS = 12
+# Most of the stream deadline the public attempt may use, and what it always
+# leaves for the ScrapeCreators fallback.
+PUBLIC_COMMENT_BUDGET_SECONDS = 15.0
+SC_COMMENT_RESERVE_SECONDS = 10.0
+
+
+def _comment_candidates(
+    items: list[dict],
+    from_date: str,
+    to_date: str,
+    creators: Iterable[str] | None = None,
+    want: int = 3,
+    topic: str = "",
+) -> list[dict]:
+    """The posts worth paying comment enrichment for.
+
+    Search results arrive before the date and relevance filters run, and the
+    loudest of them are often old or off-topic (a 2022 #bully video for "Kanye
+    West"). Picking the top posts by engagement from the raw list spent every
+    comment call on posts the report then dropped.
+
+    Posts dated outside the window are never candidates (an undated post can
+    still be kept). A post is preferred when it is on-topic the way the report
+    judges it: by the early score, by its text plus fetched caption (the report
+    rescores with the caption, so a spoken-caption match counts), or by being a
+    requested creator's post (the platform-scoped exemption the relevance prune
+    applies). Enrichment ranks its input by engagement and takes ``want``, so
+    other posts only fill the slots preferred posts leave empty, loudest
+    first, and never displace one. The dicts are shared, so comments attached
+    here stay on the kept items.
+    """
+    handles = {h.lstrip("@").strip().lower() for h in (creators or []) if h and h.strip()}
+
+    def in_window(item: dict) -> bool:
+        day = str(item.get("date") or "")
+        return not day or from_date <= day <= to_date
+
+    def preferred(item: dict) -> bool:
+        author = str(item.get("author_name") or "").lstrip("@").strip().lower()
+        if author and author in handles:
+            return True
+        score = item.get("relevance")
+        if score is None or float(score) >= relevance.RELEVANCE_FLOOR:
+            return True
+        body = " ".join(
+            str(item.get(key) or "") for key in ("text", "caption_snippet")
+        ).strip()
+        return bool(topic and body) and (
+            relevance.token_overlap_relevance(topic, body, item.get("hashtags") or None)
+            >= relevance.RELEVANCE_FLOOR
+        )
+
+    def loudness(item: dict) -> int:
+        eng = item.get("engagement") or {}
+        return sum(int(eng.get(key) or 0) for key in ("views", "likes", "comments"))
+
+    dated = [item for item in items if in_window(item)]
+    first = [item for item in dated if preferred(item)]
+    if len(first) >= want:
+        return first
+    rest = sorted((item for item in dated if not preferred(item)), key=loudness, reverse=True)
+    return first + rest[: want - len(first)]
 
 
 def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
@@ -7366,7 +7740,53 @@ def _retrieve_stream_impl(
             ):
                 sc_token = config.get("SCRAPECREATORS_API_KEY", "")
                 try:
-                    tiktok.enrich_with_comments(items, token=sc_token, deadline=deadline, cancel=cancel)
+                    public_got = 0
+                    # The public attempt gets its own short budget and always
+                    # leaves the fallback time, so a stalled endpoint cannot
+                    # use up the deadline ScrapeCreators would answer within.
+                    public_deadline = min(
+                        time.monotonic() + PUBLIC_COMMENT_BUDGET_SECONDS,
+                        deadline - SC_COMMENT_RESERVE_SECONDS,
+                    )
+                    if env.is_tiktok_public_comments_on(config) and public_deadline > time.monotonic():
+                        # Free and keyless, so every kept-sized slate of videos
+                        # gets comments, not just the three ScrapeCreators pays for.
+                        slate = _comment_candidates(
+                            items, from_date, to_date, tiktok_creators,
+                            want=PUBLIC_COMMENT_POSTS, topic=tiktok_query,
+                        )
+                        try:
+                            tiktok.enrich_with_comments(
+                                slate, token="", max_posts=PUBLIC_COMMENT_POSTS,
+                                deadline=public_deadline, cancel=cancel, public=True,
+                            )
+                        except http.DeadlineExceeded:
+                            # Only the public budget ran out: keep what came
+                            # back and let the fallback run on the real deadline.
+                            if (cancel is not None and cancel.is_set()) or time.monotonic() >= deadline:
+                                raise
+                        public_got = sum(1 for item in slate if item.get("top_comments"))
+                    if not public_got:
+                        # Endpoint off, blocked or empty: ScrapeCreators as before.
+                        tiktok.enrich_with_comments(
+                            _comment_candidates(items, from_date, to_date, tiktok_creators, topic=tiktok_query),
+                            token=sc_token, deadline=deadline, cancel=cancel,
+                        )
+                except http.DeadlineExceeded:
+                    result["error"] = tiktok.BUDGET_ERROR
+            elif (
+                items
+                and items[0].get("_oss_backend")
+                and env.is_tiktok_public_comments_on(config)
+                and result.get("error") != tiktok.BUDGET_ERROR
+            ):
+                # Keyless lane: the public endpoint is the only comment source,
+                # and the lane already returns only in-window, on-topic videos.
+                try:
+                    tiktok.enrich_with_comments(
+                        items, token="", max_posts=PUBLIC_COMMENT_POSTS,
+                        deadline=deadline, cancel=cancel, public=True,
+                    )
                 except http.DeadlineExceeded:
                     result["error"] = tiktok.BUDGET_ERROR
             return items, _result_outcome_artifact(source, result)
@@ -7377,6 +7797,7 @@ def _retrieve_stream_impl(
                 bool(env.get_tiktok_token(config)),
                 tuple(tiktok_hashtags or ()), tuple(tiktok_creators or ()),
                 env.is_tiktok_comments_available(config),
+                env.is_tiktok_public_comments_on(config),
             ),
             _fetch_tiktok,
             timeout=_memo_wait_seconds(config),
@@ -7411,7 +7832,8 @@ def _retrieve_stream_impl(
                 and not items[0].get("_oss_backend")
             ):
                 instagram.enrich_with_comments(
-                    items, token=config.get("SCRAPECREATORS_API_KEY", ""),
+                    _comment_candidates(items, from_date, to_date, ig_creators, topic=ig_query),
+                    token=config.get("SCRAPECREATORS_API_KEY", ""),
                     deadline=ig_deadline, cancel=ig_cancel,
                 )
             if (ig_cancel is not None and ig_cancel.is_set()) or time.monotonic() >= ig_deadline:

@@ -787,7 +787,8 @@ def test_bound_cached_followup_rejects_a_replacement_for_the_same_topic(tmp_path
 
 @pytest.mark.parametrize("option", ["--drill=cluster 1", "--verify-freshness"])
 @pytest.mark.parametrize(
-    "new_input", ["--x-posts=x.json", "--reddit-threads=-", "--competitors-plan=plan.json", "--plan=-"],
+    "new_input",
+    ["--x-posts=x.json", "--reddit-threads=-", "--shortform-urls=-", "--competitors-plan=plan.json", "--plan=-"],
 )
 def test_cached_followup_rejects_new_evidence_inputs(option, new_input, capsys):
     parser = cli.build_parser()
@@ -933,3 +934,9 @@ def test_drill_preserves_person_identity_anchors_without_aliasing():
     assert drill_plan.person_identity_anchors == report.query_plan.person_identity_anchors
     drill_plan.person_identity_anchors.append('Another Organization')
     assert report.query_plan.person_identity_anchors == ['Northstar Labs', 'Cedar Ventures']
+
+
+def test_drill_keeps_a_person_run_gate():
+    report = _report()
+    report.query_plan.person_run = True
+    assert planner.build_drill_plan(report, 'cluster 1').person_run is True

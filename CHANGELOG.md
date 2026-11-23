@@ -9,6 +9,76 @@ This project uses [towncrier](https://towncrier.readthedocs.io/). Upcoming notes
 
 <!-- towncrier release notes start -->
 
+## [4.6.0] - 2026-11-22
+
+### Added
+
+- Silent post-turn finished-brief capture across local agent harnesses (Claude Code via `.claude-plugin/hooks.json`, plus one-command `setup --install-hooks` / `--uninstall-hooks` for Antigravity, Gemini CLI, Codex CLI, Cursor, Grok Build CLI, and skill-only Claude Code installs). Captured briefs save atomically into `<save_dir>/finished/` with content-hash deduplication, owner-only permissions and `## From your files` redaction for `--corpus` runs, O(1) incremental `library.db` indexing, brief-first precedence in `library search` and `library feed`, and offline transcript backfill via `library harvest`.
+- TikTok top comments now come from TikTok's public web comment endpoint, which needs no key and no request signing, for up to 12 of the videos a run keeps instead of ScrapeCreators comments on 3. A "Kanye West" run went from 4 TikTok entries in Top Community Comments to 14, with no ScrapeCreators comment calls. If the endpoint returns nothing, the run falls back to ScrapeCreators comments as before. `LAST30DAYS_TIKTOK_PUBLIC_COMMENTS=off` turns the public endpoint off.
+- TikTok works without a ScrapeCreators key, and Instagram works on a best-effort basis. When the key is missing or ScrapeCreators returns HTTP 402, both sources find public post URLs and read each post with `yt-dlp`, logged out. Post URLs come from a self-hosted SearXNG (`LAST30DAYS_SEARXNG_URL`), Serper, Exa (TikTok only), Brave or the keyless floor, and on hosts with their own web search from the new `--shortform-urls` envelope, which the runbook fills from 2-3 `site:tiktok.com` / `site:instagram.com` searches. Discovery asks each backend for recent results (`LAST30DAYS_SHORTFORM_FRESHNESS`), and TikTok also lists the recent on-topic videos of creators seen in discovery (`LAST30DAYS_SHORTFORM_CREATOR_EXPANSION`). Every post is dated from its id before any fetch and again after extraction, so the lane never keeps a post from outside the research window: a thin month returns zero with the reason. Keyless TikTok videos also get their top comments, free, from TikTok's public web comment endpoint (`LAST30DAYS_TIKTOK_PUBLIC_COMMENTS`), the same source keyed runs use. Instagram recall is low (public pages, no view counts) and its comments stay ScrapeCreators-only, and keyless TikTok finds videos through creators rather than keyword search, so the key is still the better path for the month's most viral posts. `doctor` names the discovery sources armed for each platform and calls Instagram best effort. `APIFY_API_TOKEN` is no longer treated as a TikTok search credential (it was never wired to an Apify actor).
+
+### Fixed
+
+- TikTok and Instagram comments from ScrapeCreators now reach the report. Comment enrichment picked the three loudest posts from the raw search results, before the date window and topic filter ran, so it usually paid for comments on old or off-topic posts the report then dropped (for "Kanye West", a 2022 #bully video), and the kept posts had none. It now picks from posts dated inside the window that clear the topic floor.
+
+
+## [4.5.0] - 2026-11-21
+
+### Added
+
+- Add configurable SCRAPECREATORS_BASE_URL to point ScrapeCreators API calls across all modules at an enterprise proxy, local mock server, or alternative provider. ([#1367](https://github.com/mvanhorn/last30days-skill/issues/1367))
+- OpenCode agents with a paired `browse` MCP can now read public X posts and Reddit thread links in the user's logged-in browser and pass them through the existing `--x-posts` / `--reddit-threads` host envelopes. The X footer names the lane as "via OpenCode Browse".
+
+### Fixed
+
+- Browser cookie readers now include host-only cookies while excluding unrelated suffix hosts. Standalone automatic extraction prefers a complete requested cookie set, continues after browser permission denials, and keeps the first partial result only as a fallback without combining browsers. ([#1380](https://github.com/mvanhorn/last30days-skill/issues/1380))
+- Host query plans can use `omit_sources` to keep deliberately skipped optional sources out of a single run without disabling backfill for other sources. ([#1449](https://github.com/mvanhorn/last30days-skill/issues/1449))
+- Add LinkedIn to planner `SOURCE_CAPABILITIES` so queries classified under `how_to` (and `comparison`) retain LinkedIn when enabled. ([#1543](https://github.com/mvanhorn/last30days-skill/issues/1543))
+- Reddit threads from the host lane (`--reddit-threads`) get their archive comments again: `attach_comments` raised `ValueError` on every call, which was logged and swallowed, so those threads had no top comments. ([#1546](https://github.com/mvanhorn/last30days-skill/issues/1546))
+- Recover Windows Firefox cookies on WSL when SQLite cannot open the live WAL index and the database and WAL can be copied without a detected change. If the database stays unreadable, Reddit setup reports a read error instead of asking the user to log in again. ([#1547](https://github.com/mvanhorn/last30days-skill/issues/1547))
+- Bird now drops topic-supplied search operators on both the first request and retries. It keeps quoted phrases such as `"Research and Development"` intact, preserves the research date window, and caps each query at 512 characters.
+- Exa official-site fallback still fills a person's or language/OS domain. Wikidata humans with no unique company, and a direct P31 programming-language or operating-system hit, skip the company competitor index (`company_peer_discovery=keyword`). `company_via_person` stays only for a company the person leads, so patent copy does not call a person's own site "the company they lead." A product company named after its app (Raycast, Exa) still gets company peers. A trailing generic word such as Labs is trimmed once so Modal Labs matches modal.com, but an exact registrable-label match (Acme Labs → acmelabs.com) wins over the trimmed name even if the shorter domain appears first.
+- Per-source voices in report Stats now rank social handles by engagement. Doctor warns when an older Techmeme helper can only read the first page and shows how to upgrade it.
+- The top clusters now share one story cap across linked titles and query angles, leaving more room for distinct stories.
+- TikTok no longer falls back to `APIFY_API_TOKEN`: an Apify-only config used to send that token to ScrapeCreators as an API key and mark TikTok ready with no usable credential. TikTok now requires `SCRAPECREATORS_API_KEY` (found by @grain-lu in #1533).
+
+
+## [4.4.0] - 2026-11-20
+
+### Security
+
+- Auto setup reuses browser-cookie consent only when the active configuration grants it.
+- Drill follow-ups keep local file titles out of remote queries and private drill context out of published briefs.
+- GitHub research uses public repositories for search, project snapshots, and star counts. Search and repository metadata keep authenticated rate limits when configured. Comments, READMEs, and releases use the anonymous rate limit to keep enrichment public.
+- HTML briefs stage synthesis in a unique owner-only file and remove it when the sharing workflow finishes.
+- Interpreter selection, comparison JSON validation, and HTML export helpers now run in Python isolated mode.
+- Research databases, SQLite sidecars, and generated briefing archives now use owner-only permissions on POSIX.
+- Watchlist delivery hides webhook credentials from setup output, error logs, and HTTP diagnostics.
+
+### Added
+
+- Add a Turkish README with reciprocal language navigation and translation contract coverage.
+- Person runs: `--employer "Name[:domain]"`, `--linkedin URL`, or `--email ADDR` research a working professional who may have no X or GitHub presence. The run reads a bio from the employer's own site, keeps only results that name the person plus an anchor such as the employer, and adds a Person Profile section that says what was checked and why identity was accepted. With `DEEPLINE_API_KEY` it also reads the LinkedIn profile and recent posts (paid, capped per run) and shows up to a year of older posts when the last 30 days are quiet.
+- Proxy mode: with `LAST30DAYS_API_MODE=proxy`, `LAST30DAYS_API_KEY`, and `LAST30DAYS_API_BASE`, the local engine runs every source and flag while paid provider calls without a key of your own (ScrapeCreators, xAI, Serper, Parallel) go through the API key's metered proxy. The footer reports the credits each run charged, `doctor` shows those lanes as "via API key", and running out of credits skips paid sources for the rest of the run instead of failing it.
+
+### Fixed
+
+- Claude.ai skill packages now exclude development assets and apply the 200-file limit to files. Pull request validation builds the same package used for releases.
+- Direct Perplexity Deep Research uses its configured deadline alongside the ordinary source deadline, so answers can arrive after the ordinary search window closes.
+- Drill and freshness follow-ups reuse cached host evidence. Slash-command follow-ups stay bound to the original research or its latest drill.
+- Freshness verification now keeps newer cached research intact when another run finishes during the check. Cache updates publish complete files atomically.
+- Hosted mode: answer a clarification with `--clarify-angle` or `--clarify-broadly` instead of rewriting the topic, see the server's reason when a run fails instead of "unknown server error", and get a one-line notice when the hosted engine's major version differs from the local skill.
+- Hosted research rejects unsupported date windows, source filters, targeting, and output formats before submitting a search.
+- MCP and watchlist runs keep completed research when strict exit reports degraded coverage. The watchlist still delivers new findings and labels the run degraded.
+- MCP research with saving disabled leaves the report export, research caches, and SQLite findings untouched.
+- Permission preflight now follows the MCP browser-cookie policy, accounts for consented Reddit and conditional X cookie routes, and forecasts local research caches, library indexes, SQLite stores, and report exports.
+- Removing a watchlist topic preserves its recorded spending and unknown charges in the daily budget.
+- Research skips live X authentication checks when X is outside the requested source scope, the host supplies X evidence, or the run uses mock data.
+- Scheduled watchlist runs treat topic names and custom search queries as literal research text.
+- Watchlists save findings from every entity in a local comparison. Malformed output fails only the affected run, and watchlists reject unsupported hosted research before making a paid request.
+- YouTube transcript backfill and remote ranking now stop before the foreground report deadline, so a slow enrichment request can leave a useful partial report.
+
+
 ## [4.3.2] - 2026-11-17
 
 ### Changed

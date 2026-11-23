@@ -2,8 +2,9 @@
 
 TikTok and Instagram are no longer purely key-gated. Without
 SCRAPECREATORS_API_KEY they can still run when yt-dlp is installed and a
-web-discovery backend (SearXNG / TinyFish / Serper / Exa / Brave / keyless
-floor) is available. This file pins BOTH branches of that gate so a later
+discovery source (SearXNG / Serper / Exa / Brave / the keyless floor, or
+on a native-search host the host's own search via --shortform-urls) is
+available. This file pins BOTH branches of that gate so a later
 change to is_tiktok_available() / is_instagram_available() cannot silently
 collapse the fallback back to key-only, and so a keyless run does not keep
 telling the user to buy a ScrapeCreators key it will never need.
@@ -13,11 +14,15 @@ through the env.is_ytdlp_available() wrapper, so that is the symbol patched
 below -- same reason tests/test_doctor.py::_Hermetic pins it.
 """
 
+import os
+import threading
+import time
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
-from lib import env, health
+from lib import env, health, shortform_oss
 
 from tests.test_doctor import _build
 
@@ -25,7 +30,6 @@ from tests.test_doctor import _build
 # Each of these alone must be enough to arm the fallback.
 DISCOVERY_BACKENDS = [
     {"LAST30DAYS_SEARXNG_URL": "https://searx.example"},
-    {"TINYFISH_API_KEY": "tf"},
     {"SERPER_API_KEY": "sp"},
     {"EXA_API_KEY": "ex"},
     {"BRAVE_API_KEY": "br"},
@@ -55,11 +59,10 @@ class TestShortformGate:
         for cfg in DISCOVERY_BACKENDS:
             assert _gate(cfg, False) is False, cfg
 
-    def test_blank_searxng_url_does_not_open_the_gate(self):
+    def test_blank_searxng_url_is_not_listed_as_a_discovery_source(self):
         # A whitespace-only URL is a misconfiguration, not a backend.
-        assert _gate(
-            {"LAST30DAYS_SEARXNG_URL": "   ", **NATIVE_SEARCH_HOST}, True
-        ) is False
+        cfg = {"LAST30DAYS_SEARXNG_URL": "   ", **NATIVE_SEARCH_HOST}
+        assert env.shortform_discovery_sources(cfg) == ["host search"]
 
     @pytest.mark.parametrize("cfg", DISCOVERY_BACKENDS)
     def test_paid_backend_arms_the_gate_on_a_native_search_host(self, cfg):
@@ -68,9 +71,26 @@ class TestShortformGate:
 
     def test_keyless_floor_arms_the_gate_without_native_search(self):
         assert _gate({}, True) is True
+        assert env.shortform_discovery_sources({}) == ["keyless floor"]
 
-    def test_keyless_floor_is_suppressed_on_a_native_search_host(self):
-        assert _gate(dict(NATIVE_SEARCH_HOST), True) is False
+    def test_native_search_host_arms_the_gate_through_host_search(self):
+        # The keyless floor is off there; the host's own search hands the
+        # engine URLs through --shortform-urls instead.
+        assert _gate(dict(NATIVE_SEARCH_HOST), True) is True
+        assert env.shortform_discovery_sources(dict(NATIVE_SEARCH_HOST)) == ["host search"]
+
+    def test_exa_is_a_discovery_source_only_for_tiktok(self):
+        # Exa returns 0 Instagram posts; its key must not be listed there.
+        cfg = {"EXA_API_KEY": "ex", **NATIVE_SEARCH_HOST}
+        assert env.shortform_discovery_sources(cfg, "tiktok") == ["Exa", "host search"]
+        assert env.shortform_discovery_sources(cfg, "instagram") == ["host search"]
+
+    def test_discovery_sources_list_every_armed_rung_in_lane_order(self):
+        cfg = {"LAST30DAYS_SEARXNG_URL": "https://searx.example", "SERPER_API_KEY": "sp",
+               "EXA_API_KEY": "ex", "BRAVE_API_KEY": "br"}
+        assert env.shortform_discovery_sources(cfg, "tiktok") == [
+            "SearXNG", "Serper", "Exa", "Brave", "keyless floor",
+        ]
 
 
 class TestSourceAvailability:
@@ -122,9 +142,207 @@ class TestDoctorSurface:
         record = _build({}, probe_map={"yt-dlp": health.OK})["sources"]["tiktok"]
         assert record["requires"] != "SCRAPECREATORS_API_KEY"
 
+    def test_doctor_names_the_armed_discovery_sources(self):
+        report = _build({"SERPER_API_KEY": "sp", "EXA_API_KEY": "ex", **NATIVE_SEARCH_HOST},
+                        probe_map={"yt-dlp": health.OK})
+        tiktok = report["sources"]["tiktok"]["detail"]
+        assert "keyless lane armed via Serper, Exa, host search" in tiktok
+        instagram = report["sources"]["instagram"]["detail"]
+        assert "via Serper, host search" in instagram and "Exa" not in instagram
+
+    def test_doctor_calls_instagram_best_effort(self):
+        report = _build({}, probe_map={"yt-dlp": health.OK})
+        assert "best effort, low recall" in report["sources"]["instagram"]["detail"]
+        assert "best effort" not in report["sources"]["tiktok"]["detail"]
+        assert "keyless floor" in report["sources"]["tiktok"]["detail"]
+
     def test_doctor_keeps_the_key_gated_verdict_when_ytdlp_is_absent(self):
         report = _build({}, probe_map={"yt-dlp": health.MISSING})
         for name in ("tiktok", "instagram"):
             record = report["sources"][name]
             assert record["tier"] == "off", name
             assert record["requires"] == "SCRAPECREATORS_API_KEY", name
+
+class TestDeadlineAndCancel:
+    """The fallback must stop starting work once the run is cancelled."""
+
+    def _no_work(self):
+        return mock.patch.multiple(
+            "lib.shortform_oss",
+            discover_urls=mock.DEFAULT,
+            enrich_urls=mock.DEFAULT,
+            creator_urls=mock.DEFAULT,
+        )
+
+    def test_past_deadline_returns_error_without_discovery(self):
+        with mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=True), \
+             mock.patch("lib.shortform_oss.discover_urls") as disc, \
+             mock.patch("lib.shortform_oss.enrich_urls") as enrich:
+            result = shortform_oss.search(
+                "tiktok", "topic", "2026-01-01", "2026-12-31", "default", {},
+                deadline=time.monotonic() - 1.0,
+            )
+        assert result["items"] == []
+        assert "deadline" in result["error"]
+        disc.assert_not_called()
+        enrich.assert_not_called()
+
+    def test_cancelled_event_returns_error_without_discovery(self):
+        cancel = threading.Event()
+        cancel.set()
+        with mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=True), \
+             mock.patch("lib.shortform_oss.discover_urls") as disc, \
+             mock.patch("lib.shortform_oss.enrich_urls") as enrich:
+            result = shortform_oss.search(
+                "instagram", "topic", "2026-01-01", "2026-12-31", "default", {},
+                cancel=cancel,
+            )
+        assert result["items"] == []
+        assert result["error"]
+        disc.assert_not_called()
+        enrich.assert_not_called()
+
+    def test_enrich_skips_when_deadline_passes_during_discovery(self):
+        with mock.patch("lib.shortform_oss.discover_urls",
+                        return_value=(["https://www.tiktok.com/@u/video/1"], "searxng")), \
+             mock.patch("lib.shortform_oss.enrich_urls") as enrich:
+            result = shortform_oss.search(
+                "tiktok", "topic", "2026-01-01", "2026-12-31", "default", {},
+                deadline=time.monotonic() - 1.0,
+            )
+        enrich.assert_not_called()
+        assert result["items"] == []
+
+
+class TestKeylessRungPolicy:
+    """Discovery must follow the same keyless policy the availability gate used."""
+
+    def test_keyless_rung_is_skipped_on_native_search_hosts(self):
+        with mock.patch("lib.web_search_keyless.keyless_search",
+                        side_effect=AssertionError("keyless ran on a native-search host")):
+            urls, backend = shortform_oss.discover_urls(
+                "tiktok", "topic", {"LAST30DAYS_NATIVE_SEARCH": "1"}, 5,
+            )
+        assert urls == []
+        assert backend == "none"
+
+    def test_keyless_rung_is_skipped_when_the_host_passed_urls(self):
+        from lib import shortform_envelope
+
+        env = shortform_envelope.Envelope(
+            path="x.json", sha256="0", topic="topic", tiktok_posts=[], instagram_posts=[],
+            tiktok_creators=[], counters={}, total=0, notes=[],
+        )
+        with mock.patch("lib.web_search_keyless.keyless_search",
+                        side_effect=AssertionError("keyless ran after the host searched")):
+            urls, backend = shortform_oss.discover_urls(
+                "tiktok", "topic", {"_shortform_envelope": env}, 5,
+            )
+        assert (urls, backend) == ([], "none")
+
+    def test_keyless_rung_runs_when_policy_allows_it(self):
+        canned = ({"url": "https://www.tiktok.com/@u/video/1"},)
+        with mock.patch("lib.web_search_keyless.keyless_search",
+                        return_value=(list(canned), {"keyless_backend": "ddg"})) as ks:
+            urls, backend = shortform_oss.discover_urls("tiktok", "topic", {}, 5)
+        ks.assert_called_once()
+        assert urls == ["https://www.tiktok.com/@u/video/1"]
+        assert backend == "ddg"
+
+
+class TestInstagramFallbackErrorSurfaces:
+    """Without a token the paid loop never runs, so the OSS error must surface."""
+
+    def test_no_token_oss_error_is_returned(self):
+        from lib import instagram as ig
+
+        with mock.patch("lib.shortform_oss.search",
+                        return_value={"items": [], "error": "oss discovery empty"}):
+            result = ig.search_and_enrich(
+                "topic", "2026-01-01", "2026-12-31", "default", None, config={},
+            )
+        assert result["error"] == "oss discovery empty"
+
+
+class TestSshRoutedExtraction:
+    """SSH-routed hosts (LAST30DAYS_YOUTUBE_SSH_HOST) extract remotely.
+
+    The availability gate follows youtube_yt.is_ytdlp_installed(), which is
+    True on SSH-routed hosts without a local binary — so extraction must run
+    through the same SSH wrapper instead of a local FileNotFoundError.
+    """
+
+    SSH_ENV = {"LAST30DAYS_YOUTUBE_SSH_HOST": "macmini"}
+
+    def test_gate_opens_on_ssh_routed_host_without_local_binary(self):
+        with mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=True) as inst, \
+             mock.patch.dict(os.environ, self.SSH_ENV):
+            # is_ytdlp_installed is what the gate reads; on SSH hosts it
+            # returns True without a local binary, and extraction must
+            # therefore route over ssh (pinned below).
+            assert env.is_shortform_oss_available({"SERPER_API_KEY": "sp"}) is True
+        inst.assert_called_once()
+
+    def test_enrich_urls_wrap_the_command_with_ssh(self):
+        from lib import subproc as subproc_mod
+
+        captured = {}
+
+        def fake_run(cmd, timeout=None, input_text=None, **_kw):
+            captured["cmd"] = cmd
+            captured["input"] = input_text
+            return SimpleNamespace(stdout="")
+
+        url = "https://www.tiktok.com/@u/video/1"
+        with mock.patch.dict(os.environ, self.SSH_ENV), \
+             mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=True), \
+             mock.patch.object(subproc_mod, "run_with_timeout", side_effect=fake_run):
+            items = shortform_oss.enrich_urls("tiktok", [url], "topic")
+        assert items == []
+        cmd = captured["cmd"]
+        assert cmd[0] == "ssh"
+        assert "macmini" in cmd
+        assert "yt-dlp" in " ".join(cmd)
+        assert "--dump-json" in " ".join(cmd)
+        assert url in (captured["input"] or "")
+
+    def test_creator_urls_wrap_the_command_with_ssh(self):
+        from lib import subproc as subproc_mod
+
+        captured = {}
+
+        def fake_run(cmd, timeout=None, input_text=None, **_kw):
+            captured["cmd"] = cmd
+            return SimpleNamespace(stdout='{"id": "1234567890", "title": "t"}')
+
+        with mock.patch.dict(os.environ, self.SSH_ENV), \
+             mock.patch.object(subproc_mod, "run_with_timeout", side_effect=fake_run):
+            urls = shortform_oss.creator_urls("tiktok", "creator", 3)
+        assert urls == ["https://www.tiktok.com/@creator/video/1234567890"]
+        assert captured["cmd"][0] == "ssh"
+
+    def test_local_hosts_still_run_yt_dlp_directly(self):
+        from lib import subproc as subproc_mod
+
+        captured = {}
+
+        def fake_run(cmd, timeout=None, input_text=None, **_kw):
+            captured["cmd"] = cmd
+            return SimpleNamespace(stdout="")
+
+        # Pin yt-dlp presence: CI runners do not have yt-dlp on PATH, and
+        # enrich_urls gates on is_ytdlp_installed() before building the
+        # command — unpinned, the fake never runs there. The SSH var is also
+        # unset (not empty-string-set) so _ytdlp_ssh_host() cannot wrap.
+        saved = os.environ.pop("LAST30DAYS_YOUTUBE_SSH_HOST", None)
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                 mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=True), \
+                 mock.patch.object(subproc_mod, "run_with_timeout", side_effect=fake_run):
+                shortform_oss.enrich_urls(
+                    "tiktok", ["https://www.tiktok.com/@u/video/1"], "topic",
+                )
+        finally:
+            if saved is not None:
+                os.environ["LAST30DAYS_YOUTUBE_SSH_HOST"] = saved
+        assert captured["cmd"][0] == "yt-dlp"

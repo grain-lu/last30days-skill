@@ -176,6 +176,9 @@ Before running the engine, determine every applicable targeting flag and resolve
 | `--ticker="{SYMBOL}:{Company}"` | Section B | Topic is a listed company, a person who leads one, or a product or subsidiary of one |
 | `--company="{Name}:{site}"` | Section B | A person's company or a product's maker, listed or not |
 | `--jobs-board={URL}` | Section B | A search showed its job board |
+| `--employer="{Name}[:{domain}]"` | User's words | The user named a working person's employer. Never for a famous figure (paid LinkedIn reads add nothing). Starts a person run: drops name-only evidence; reads the employer's bio (and LinkedIn with `DEEPLINE_API_KEY`). For a company the person leads, use `--company` |
+| `--linkedin={URL}` | User's words | The user supplied the person's LinkedIn URL; trusted as their identity |
+| `--email={address}` | User's words | The user supplied an email. A work domain anchors identity; a personal one only drives the LinkedIn lookup. Never ask for one |
 | `--github-user={user}` | Step 0.5b | Topic is a person who ships code (developer, engineer, CEO-who-codes, researcher) |
 | `--github-repo={owner/repo}` | Step 0.5c | Topic is a product / project / open-source tool |
 | `--trustpilot-domain={domain}` | Step 0.5d | Topic is a company / brand / service and `--diagnose` reports `trustpilot_can_run` (the flag also activates the opt-in Trustpilot source) |
@@ -191,6 +194,8 @@ Before running the engine, determine every applicable targeting flag and resolve
 | `--auto-resolve` | Fallback | WebSearch is available but Step 0.55 could not resolve everything cleanly — use as belt-and-suspenders |
 
 **Checkpoint before running the engine:** your Bash command must include every flag from the checklist that applies to this topic. For a person who ships code (the Peter Steinberger class), that is MINIMUM `--x-handle` AND `--github-user` AND `--subreddits`, and typically `--x-related` too. A command with only `--x-handle` on a person topic is a pre-flight skip and a Step 0.5 regression.
+
+**Working person:** pass `--employer` when the user names their company, and `--linkedin`/`--email` only as supplied, never asked for. Given a name alone, tell the user an employer would sharpen the result.
 
 ---
 
@@ -373,11 +378,11 @@ Store: `META_ADS_PAGE = {page id or empty}` — add `meta_ads` to `--search`, an
 
 ## Step 0.55: Pre-Research Intelligence (resolve communities + handles)
 
-> **PLATFORM GATE:** If your platform does NOT support WebSearch (e.g., OpenClaw, raw CLI), **skip Steps 0.55 and 0.75** but add `--auto-resolve` to the Python command in the Research Execution section. The engine will do its own pre-research using configured web search backends (Brave, Exa, or Serper) to discover subreddits, X handles, and current events context before planning.
+> **PLATFORM GATE:** If your platform does NOT support WebSearch (e.g., OpenClaw, raw CLI), **skip Steps 0.55 and 0.75** but add `--auto-resolve` to the Python command in the Research Execution section. The engine then resolves subreddits, X handles, and news with its configured web backends.
 
 **MANDATORY on Claude Code (and any platform with WebSearch), on every run, including repeat runs of the same topic.** Run Step 0.55 before the engine. An engine command without a `--plan` carrying resolved handles and subreddits is a Step 0.55 skip, and the engine's `[Resolve] No web search backend available, skipping resolve` line means this step was skipped, not that the engine covered it.
 
-**Run 2-3 focused WebSearches (in parallel, inside the pre-engine isolated web search dispatch) to resolve platform-specific targeting. Do NOT search for every platform individually: infer most targeting from your knowledge of the topic, and WebSearch only for what you can't infer.**
+**Run 2-3 focused WebSearches (in parallel, inside the pre-engine isolated web search dispatch) to resolve platform-specific targeting. Infer the rest from your knowledge of the topic.**
 
 **1. X handles** - Already resolved in Step 0.5 above (including company handles and commentators). Reference your `RESOLVED_HANDLE` and `RESOLVED_RELATED` from that step.
 
@@ -402,7 +407,7 @@ Label conservatively: only a sub clearly named for / dedicated to the entity goe
 
 **Category peers:** when the product eligibility rule above applies, follow the root routing gate for `category-peers.md` before continuing.
 
-**2b. Host Reddit threads.** Keep each `reddit.com/r/<sub>/comments/<id>/` URL found (no `/s/` share or redirect links; max 50). The engine reads only `url`, rehydrates each thread, drops off-topic or stale ones. Only if any were found, write them with a single-quoted heredoc and add `--reddit-threads=/tmp/l30d-threads.json` (single-topic runs):
+**2b. Host Reddit threads.** Keep each `reddit.com/r/<sub>/comments/<id>/` URL found (no `/s/` share or redirect links; max 50). The engine reads only `url`, drops off-topic or stale ones. If any, write them with a single-quoted heredoc and add `--reddit-threads=/tmp/l30d-threads.json` (single-topic runs, as for 2c):
 
 ```bash
 cat > /tmp/l30d-threads.json <<'THREADS_EOF'
@@ -410,18 +415,20 @@ cat > /tmp/l30d-threads.json <<'THREADS_EOF'
 THREADS_EOF
 ```
 
-**3. TikTok hashtags + creators** - **INFER these from your topic knowledge. Do NOT WebSearch for "{PERSON} TikTok account" - most people/CEOs don't have TikTok, and the search is wasted.**
+**2c. Host TikTok/Instagram URLs.** Only if `tiktok` or `instagram` is active and `has_scrapecreators` is false: run 2-3 searches (`{TOPIC} site:tiktok.com`, `{TOPIC} tiktok account`, `site:instagram.com reel {TOPIC}`); keep post and `@creator` URLs, even old (max 40). Add up to 5 handles posting on it (official, fan, reviewer) to `RESOLVED_TIKTOK_CREATORS`. If any, write `/tmp/l30d-shortform.json` as `{"schema": "last30days-shortform-urls/1", "topic": "{TOPIC}", "urls": [{"url": "{URL}"}]}` and add `--shortform-urls=/tmp/l30d-shortform.json`.
 
-- **Hashtags:** Infer 2-3 from the topic name + category. Examples: "Kanye West" → `kanyewest,ye,bully`. "Claude Code" → `claudecode,aiagent,aicoding`. "Sam Altman" → `samaltman,openai,chatgpt`.
-- **Creators:** Only search if the topic is a content creator, influencer, or brand that likely has TikTok presence. For CEOs, politicians, and non-creator people: skip.
+**3. TikTok hashtags + creators** - **INFER these from topic knowledge. Never WebSearch for a TikTok account (2c aside); most people and CEOs have none.**
+
+- **Hashtags:** Infer 2-3 from the topic name + category. Examples: "Kanye West" → `kanyewest,ye,bully`. "Claude Code" → `claudecode,aiagent,aicoding`.
+- **Creators:** Only for a creator, influencer, or brand likely on TikTok; skip CEOs, politicians, other people.
 
 Store as `RESOLVED_HASHTAGS` and `RESOLVED_TIKTOK_CREATORS`.
 
-**4. Instagram creators** - **Same rule: INFER from topic knowledge.** If the topic is a celebrity, brand, or creator with obvious Instagram presence, use their handle directly. If the topic is a tech CEO or abstract concept, skip. Do NOT waste a WebSearch on "Dario Amodei Instagram account."
+**4. Instagram creators** - **Same rule: INFER from topic knowledge.** Use the handle of a celebrity, brand, or creator with obvious Instagram presence; skip tech CEOs and abstract concepts. Never WebSearch for a handle.
 
 Store as `RESOLVED_IG_CREATORS`.
 
-**5. YouTube content queries** - Infer 2-3 YouTube content-type queries from the topic without searching. The current events search (#2 above) may surface relevant YouTube channels.
+**5. YouTube content queries** - Infer 2-3 YouTube content-type queries from the topic without searching.
 
 - **For music artists:** `'{TOPIC} album review'`, `'{TOPIC} reaction'`
 - **For products/SaaS:** `'{TOPIC} review'`, `'{TOPIC} tutorial'`
@@ -539,7 +546,8 @@ Only show lines for platforms where something was resolved. On the Reddit line, 
 
 **Rules for your plan:**
 - Emit 1 to 4 subqueries (more for multi-faceted topics, fewer for simple ones)
-- **CRITICAL: Your PRIMARY subquery MUST include every applicable source from `ACTIVE_SOURCES_LIST`, including installed lanes such as digg, arxiv, techmeme, bluesky, and linkedin.** Leave out only `grounding`, `corpus`, `perplexity` (engine-attached) and `amazon` / `meta_ads` (the engine adds them when `--search` names them; Step 0.5e / 0.5f). For a company or the person who leads it, name `jobs` (unlisted) plus top-level `jobs_queries`: 2-4 product or team terms, not the company name. Never invent an unavailable source. Preserve X whenever it is active. Never omit active Reddit (highest-signal discussion) or active YouTube (unique transcripts + official content). Secondary subqueries can target specific platforms. Above quick depth, an installed lane named in no subquery is added to the primary subquery unless it cannot run (Trustpilot when `trustpilot_can_run` is false); exclusions win.
+- **Primary: include every applicable source from `ACTIVE_SOURCES_LIST`.** Preserve X whenever it is active. Keep active Reddit and YouTube. Never add unavailable sources. Leave out only `grounding`, `corpus`, `perplexity` (engine-attached), `amazon` / `meta_ads` (`--search`, Steps 0.5e / 0.5f), and explicit omissions. For a company or the person who leads it, name `jobs` (unlisted) plus top-level `jobs_queries`: 2-4 product or team terms, not the company name.
+- Above quick depth, an unnamed optional lane is added to the primary subquery unless it cannot run (Trustpilot when `trustpilot_can_run` is false); exclusions win. To avoid backfilling a lane (digg, arxiv, techmeme, bluesky, truthsocial, stocktwits, linkedin, dripstack, devto, telegram, trustpilot), omit it from all subqueries and list it in top-level `"omit_sources": ["arxiv"]`. Never omit a user-requested source.
 - `search_query` should be concise and keyword-heavy - match how content is TITLED on platforms
 - `ranking_query` should read like a natural language question
 - **X disambiguation:** express your disambiguation intent in `ranking_query` (e.g., "What are people saying about Rome the city in Italy, not AS Roma or Rome Odunze?") — do not phrase-quote `search_query` for X or invent X operators; the engine handles X query compilation internally.

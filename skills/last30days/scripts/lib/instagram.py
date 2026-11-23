@@ -27,6 +27,13 @@ from .relevance import token_overlap_relevance as _compute_relevance
 
 SCRAPECREATORS_BASE = "https://api.scrapecreators.com"
 
+
+def _sc_base() -> str:
+    if SCRAPECREATORS_BASE != "https://api.scrapecreators.com":
+        return SCRAPECREATORS_BASE
+    from . import env
+    return env.get_scrapecreators_base_url()
+
 # Depth configurations: how many results to fetch / captions to extract
 DEPTH_CONFIG = {
     "quick":   {"results_per_page": 10, "max_captions": 3},
@@ -130,7 +137,7 @@ def _get_reels_search(
     cancel: threading.Event | None,
 ) -> dict[str, Any]:
     return http.get(
-        f"{SCRAPECREATORS_BASE}/v2/instagram/reels/search",
+        f"{_sc_base()}/v2/instagram/reels/search",
         params={"query": query},
         headers=http.scrapecreators_headers(token),
         retries=2,
@@ -332,7 +339,7 @@ def _user_reels(
     if _budget_expired(deadline, cancel):
         return []
     _log(f"User reels: @{handle}")
-    reels_url = f"{SCRAPECREATORS_BASE}/v1/instagram/user/reels"
+    reels_url = f"{_sc_base()}/v1/instagram/user/reels"
     try:
         data = http.get(
             reels_url,
@@ -436,7 +443,7 @@ def _google_reel_fallback(
             # with a swallowed 404 once the adapter reports a clean result.
             with http.expected_misses(404):
                 data = http.get(
-                    f"{SCRAPECREATORS_BASE}/v1/google/search",
+                    f"{_sc_base()}/v1/google/search",
                     params={
                         "query": (
                             f"site:instagram.com/reel {topic} "
@@ -518,7 +525,7 @@ def _google_reel_fallback(
             return None
         try:
             payload = http.get(
-                f"{SCRAPECREATORS_BASE}/v1/instagram/post",
+                f"{_sc_base()}/v1/instagram/post",
                 params={"url": url},
                 headers=headers,
                 retries=1,
@@ -771,7 +778,7 @@ def fetch_captions(
             # poison the entire source outcome (#829).
             with http.capture_failures() as _tf:
                 data = http.get(
-                    f"{SCRAPECREATORS_BASE}/v2/instagram/media/transcript",
+                    f"{_sc_base()}/v2/instagram/media/transcript",
                     params={"url": url},
                     headers=http.scrapecreators_headers(token),
                     retries=1,
@@ -850,38 +857,42 @@ def search_and_enrich(
                     seen_ids.add(vid)
                     items.append(item)
 
-    # Step 1: Multi-query keyword search — run ScrapeCreators for each expanded query
-    queries = expand_instagram_queries(topic, depth)
-    fallback_pages, fallback_posts = GOOGLE_FALLBACK_BUDGETS.get(
-        depth, GOOGLE_FALLBACK_BUDGETS["default"]
-    )
-    fallback_cache: dict[str, dict[str, Any]] = {}
-    for index, q in enumerate(queries):
-        if _budget_expired(deadline, cancel):
-            break
-        query_count = len(queries)
-        query_budget = {
-            "pages": fallback_pages // query_count
-            + (1 if index < fallback_pages % query_count else 0),
-            "posts": fallback_posts // query_count
-            + (1 if index < fallback_posts % query_count else 0),
-        }
-        search_result = search_instagram(
-            q, from_date, to_date, depth, token,
-            _fallback_budget=query_budget, _fallback_cache=fallback_cache,
-            deadline=deadline, cancel=cancel,
+    # Step 1: Multi-query keyword search — run ScrapeCreators for each expanded
+    # query. Without a token every call would just fail with "No
+    # SCRAPECREATORS_API_KEY configured", so skip straight to the OSS fallback
+    # (mirrors tiktok.search_and_enrich's ``if token:`` guard).
+    if token:
+        queries = expand_instagram_queries(topic, depth)
+        fallback_pages, fallback_posts = GOOGLE_FALLBACK_BUDGETS.get(
+            depth, GOOGLE_FALLBACK_BUDGETS["default"]
         )
-        if search_result.get("error"):
-            error = search_result["error"]
-            state = search_result.get("_error_state") or http.classify_failure(message=error)
-            query_errors.append((error, state))
-            if not search_result.get("_discovery_only_error"):
-                last_error = error
-        for item in search_result.get("items", []):
-            vid = item.get("video_id", "")
-            if vid and vid not in seen_ids:
-                seen_ids.add(vid)
-                items.append(item)
+        fallback_cache: dict[str, dict[str, Any]] = {}
+        for index, q in enumerate(queries):
+            if _budget_expired(deadline, cancel):
+                break
+            query_count = len(queries)
+            query_budget = {
+                "pages": fallback_pages // query_count
+                + (1 if index < fallback_pages % query_count else 0),
+                "posts": fallback_posts // query_count
+                + (1 if index < fallback_posts % query_count else 0),
+            }
+            search_result = search_instagram(
+                q, from_date, to_date, depth, token,
+                _fallback_budget=query_budget, _fallback_cache=fallback_cache,
+                deadline=deadline, cancel=cancel,
+            )
+            if search_result.get("error"):
+                error = search_result["error"]
+                state = search_result.get("_error_state") or http.classify_failure(message=error)
+                query_errors.append((error, state))
+                if not search_result.get("_discovery_only_error"):
+                    last_error = error
+            for item in search_result.get("items", []):
+                vid = item.get("video_id", "")
+                if vid and vid not in seen_ids:
+                    seen_ids.add(vid)
+                    items.append(item)
 
     # Sort merged results by views descending
     items.sort(key=lambda x: x.get("engagement", {}).get("views") or 0, reverse=True)
@@ -894,9 +905,8 @@ def search_and_enrich(
     if _budget_expired(deadline, cancel):
         last_error = RESEARCH_TIMEOUT
 
-    # OSS fallback (local): keyless web discovery + yt-dlp when the key is
-    # missing or credits are exhausted. Independent of the ScrapeCreators
-    # deadline, so it still runs after a budget stop.
+    # OSS fallback: web discovery + yt-dlp when the key is missing or credits
+    # are exhausted. Bounded by the same deadline/cancel as the paid path.
     from_oss = False
     if not items and (not token or shortform_oss.credits_exhausted(last_error)):
         cfg = config
@@ -905,13 +915,18 @@ def search_and_enrich(
             cfg = envmod.get_config()
         oss = shortform_oss.search(
             "instagram", topic, from_date, to_date, depth, cfg,
+            deadline=deadline, cancel=cancel,
         )
         items = oss.get("items") or []
         from_oss = bool(items)
         if from_oss:
             last_error = None
-        elif not last_error:
-            last_error = oss.get("error")
+        elif not token or not last_error:
+            # No paid loop ran (or produced nothing to say): a fallback
+            # failure must surface, not hide behind a budget-stop message.
+            # With a token, the ScrapeCreators error keeps priority — it is
+            # the root cause the fallback just failed to rescue.
+            last_error = oss.get("error") or last_error
 
     if not items:
         return {"items": [], "error": last_error}
@@ -1033,7 +1048,7 @@ def _fetch_post_comments(
         return []
     try:
         data = http.get(
-            f"{SCRAPECREATORS_BASE}/v2/instagram/post/comments",
+            f"{_sc_base()}/v2/instagram/post/comments",
             params={"url": post_url},
             headers=http.scrapecreators_headers(token),
             retries=2,

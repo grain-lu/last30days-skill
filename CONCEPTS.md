@@ -16,6 +16,10 @@ The Python script (`scripts/last30days.py`) the Skill's SKILL.md invokes to do t
 
 The agent runtime that loads Skills and invokes them on the user's behalf. Claude Code is the most common Harness for this Skill but not the only one — Codex, Cursor, GitHub Copilot, Gemini CLI, and the rest of the Agent Skills ecosystem also count. "Multi-harness" describes a Skill that works correctly across every Harness it installs into; features written without multi-harness awareness (e.g., engine flags with no SKILL.md integration, or paths hardcoded to one Harness's install layout) regress on Harnesses other than the one they were tested against.
 
+### Finished brief
+
+The synthesized, human-readable `/last30days` report rendered in chat—bounded by its opening `🌐 last30days` badge and closing fenced engine footer—as distinct from the raw evidence dump (`*-raw*.md`) written by the Engine. Captured Finished briefs live in `<save_dir>/finished/<slug>-YYYY-MM-DD.md` (via silent post-turn harness hooks or offline `library harvest`), use owner-only permissions when tainted by local `--corpus` notes, and take precedence over unsuffixed raw dumps for the same topic and date in `library search` and `library feed`.
+
 ## Research pipeline
 
 ### Primary entity
@@ -59,6 +63,18 @@ A Reddit thread that clears the relevance floor, passes Entity grounding, and ra
 ### Prominent Digg story
 
 A Digg story whose title names the run topic as a whole word or phrase and that has a Digg Score of at least 40 and at least 5 sources. A story that names the topic in its title but is smaller, or whose title carries part of the topic (one word of a two-word name, or a telling word of a longer description), is an ordinary story. Every other story is dropped from the run, including one that names the topic only in its summary. The verdict is worked out from the topic and the story's own text and numbers each time it is needed and is never stored on the item. Clusters from digg-pp-cli 2026.10.x carry no story UUID and are not judged.
+
+### Person run
+
+A run about a working person that the host starts by passing an employer, a LinkedIn URL, or an email (`--employer`, `--linkedin`, `--email`). It resolves who the person is before searching: their LinkedIn profile (with a Deepline key), their bio on the employer's site, and their own X, GitHub, and site links. Only an Identity anchor or a first-party source admits evidence. A run on a bare name is not a person run and behaves as before.
+
+### Identity anchor
+
+A non-name fact that ties an item to the person in a Person run: the employer's name or domain, a work email's domain, the person's LinkedIn URL, or the employer their verified profile lists. An item that matches only the name is dropped and counted. Items from the person's own accounts pass on a first-party marker. A personal email domain is never an anchor, and a handle the Engine discovered for the person anchors only items that handle wrote; it never confirms the person's identity.
+
+### Older evidence
+
+The person's own LinkedIn posts from before the window, up to a year back, shown with their real dates in the `## Person Profile` block when fewer than three first-party items fall inside the window. Older evidence never enters the ranked findings, so a report never presents it as recent.
 
 ### Patent Digest
 
@@ -135,6 +151,12 @@ An X result the hosting model fetched itself, through its own X connector, and h
 One full research run for one entity of an "X vs Y" comparison; the Engine runs every entity's sub-run in parallel and renders them side by side. *Avoid: competitor run, peer run (for the run itself; "peer" still names a non-main entity).*
 
 Sub-runs share the process's limits (the YouTube fetch gate, paid-call budgets), so any per-run budget for work behind one of those limits is split across the sub-runs rather than granted to each in full. Otherwise the comparison multiplies the work and every sub-run misses the wait a single run fits inside.
+
+## Paid lanes
+
+### Proxy lane
+
+A paid provider lane (ScrapeCreators, xAI, Serper, Parallel) that, in proxy mode (`LAST30DAYS_API_MODE=proxy` with an API key and base), runs on the local Engine but is billed to the API key: the user holds no key for that provider, so its calls go through the hosted service's metered proxy. A key the user set always keeps its provider's lane direct, and a backend the user holds a key for ranks ahead of a Proxy lane serving the same need. Only calls made through the Engine's shared HTTP layer can be Proxy lanes; CLI-based backends and raw-socket clients never are. Free sources are never Proxy lanes. Once the key runs out of credits or hits its spend ceiling, every Proxy lane is off for the rest of the run. *Avoid: hosted mode (that hands the whole run to the service).*
 
 ## Flagged ambiguities
 

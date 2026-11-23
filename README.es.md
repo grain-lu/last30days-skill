@@ -224,6 +224,10 @@ npx skills update -g
 
 Puedes listarlo y desinstalarlo con `npx skills list -g` y `npx skills remove last30days -g`.
 
+### DeepSeek Harness
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) carga skills desde `~/.agents/skills` (o `$DSH_AGENTS_HOME/skills` si está definido). Ahí es donde la instalación global con `npx skills add mvanhorn/last30days-skill -g` deja last30days, así que DSH lo detecta sin configuración adicional. Reinicia DSH después de instalar.
+
 ### claude.ai (web)
 
 1. [Descarga `last30days.skill`](https://github.com/mvanhorn/last30days-skill/releases/latest/download/last30days.skill) de la última versión publicada
@@ -286,6 +290,7 @@ Estas plataformas no tienen ninguna relación entre sí. X no sabe lo que piensa
 | YouTube | `brew install yt-dlp` | Gratis |
 | Bluesky | Una contraseña de aplicación de bsky.app | Gratis |
 | TikTok + Instagram + Threads + Pinterest + LinkedIn + comentarios de YouTube | Una clave de ScrapeCreators | 10.000 llamadas gratis y luego pago por uso |
+| TikTok (e Instagram, con cobertura limitada) sin clave | `yt-dlp`, que se usa cuando no hay clave de ScrapeCreators; menos resultados y sin comentarios | Gratis |
 | Xiaohongshu (RED) | Ten corriendo un plugin de navegador x-mcp con sesión iniciada o un servicio `xiaohongshu-mcp`, y activa la fuente con `--search xhs` por ejecución o con `INCLUDE_SOURCES=xiaohongshu` en `.env`; last30days prueba automáticamente `http://localhost:18060` y después `http://host.docker.internal:18060`, o usa `XIAOHONGSHU_API_BASE` para una URL propia | No hace falta clave de API de last30days; depende de tu servicio local de sesión de navegador |
 | DripStack (boletines financieros premium) | Opcional: `--search dripstack` por ejecución, o `INCLUDE_SOURCES=dripstack` en `.env` | Sin clave; API de búsqueda pública y gratuita |
 | Perplexity Agent API / Search API / Deep Research | Una clave de Perplexity, o una clave de OpenRouter como alternativa para Sonar | Pago por uso; una clave directa habilita la Agent API y Deep Research en segundo plano |

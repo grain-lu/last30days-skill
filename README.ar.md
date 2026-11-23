@@ -237,6 +237,10 @@ npx skills update -g
 
 يمكن عرض المهارات أو إزالتها باستخدام `npx skills list -g` و`npx skills remove last30days -g`
 
+### DeepSeek Harness
+
+يحمّل [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) المهارات من `~/.agents/skills` (أو `$DSH_AGENTS_HOME/skills` عند تعيينه). وهذا هو المكان الذي يضع فيه التثبيت العام `npx skills add mvanhorn/last30days-skill -g` مهارة last30days، لذلك يتعرّف عليها DSH دون أي إعداد إضافي. أعد تشغيل DSH بعد التثبيت.
+
 ### claude.ai (الويب)
 
 1. [حمل ملف `last30days.skill`](https://github.com/mvanhorn/last30days-skill/releases/latest/download/last30days.skill) من أحدث إصدار
@@ -294,6 +298,7 @@ ln -s "$(pwd)/last30days-skill/skills/last30days" ~/.claude/skills/last30days
 | YouTube | `brew install yt-dlp` | مجاني |
 | Bluesky | كلمة مرور التطبيق من bsky.app | مجاني |
 | TikTok وInstagram وThreads وPinterest وLinkedIn وتعليقات YouTube | مفتاح ScrapeCreators | 10,000 استدعاء مجاني، ثم الدفع حسب الاستخدام |
+| TikTok (وInstagram بتغطية محدودة) دون مفتاح | `yt-dlp`، ويُستخدم عند عدم ضبط مفتاح ScrapeCreators؛ نتائج أقل ودون تعليقات | مجاني |
 | Xiaohongshu (RED) | تشغيل `x-mcp` أو `xiaohongshu-mcp` محليا مع جلسة دخول، ثم اختيار `--search xhs` أو `INCLUDE_SOURCES=xiaohongshu` في `.env`، وتفحص last30days العنوانين `http://localhost:18060` و`http://host.docker.internal:18060` تلقائيا، أو تستخدم `XIAOHONGSHU_API_BASE` لعنوان آخر | لا تحتاج إلى مفتاح API خاص بـlast30days، وتتوقف التكلفة على خدمة جلسة المتصفح المحلية |
 | DripStack | تفعيل `--search dripstack` أو `INCLUDE_SOURCES=dripstack` | API عامة مجانية دون مفتاح |
 | Perplexity Agent API وSearch API وDeep Research | مفتاح Perplexity أو OpenRouter كبديل Sonar | الدفع حسب الاستخدام، ويتيح المفتاح المباشر Agent API وDeep Research في الخلفية |

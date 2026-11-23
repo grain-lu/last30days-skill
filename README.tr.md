@@ -224,6 +224,10 @@ npx skills update -g
 
 Listelemek ve kaldırmak için `npx skills list -g` ve `npx skills remove last30days -g` kullanın.
 
+### DeepSeek Harness
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH), skill'leri `~/.agents/skills` dizininden (ayarlıysa `$DSH_AGENTS_HOME/skills`) yükler. `npx skills add mvanhorn/last30days-skill -g` ile yapılan global kurulum last30days'i tam olarak buraya koyar, bu yüzden DSH onu ek bir ayar gerekmeden bulur. Kurulumdan sonra DSH'yi yeniden başlatın.
+
 ### claude.ai (web)
 
 1. Son sürümden [`last30days.skill` indirin](https://github.com/mvanhorn/last30days-skill/releases/latest/download/last30days.skill)
@@ -285,6 +289,7 @@ Bu platformlar birbirine bağlı değil. X, Reddit'in ne düşündüğünü bilm
 | YouTube | `brew install yt-dlp` | Ücretsiz |
 | Bluesky | bsky.app uygulama parolası | Ücretsiz |
 | TikTok + Instagram + Threads + Pinterest + LinkedIn + YouTube yorumları | ScrapeCreators anahtarı | İlk 10.000 çağrı ücretsiz, sonra kullandıkça öde |
+| Anahtarsız TikTok (Instagram sınırlı) | `yt-dlp`; ScrapeCreators anahtarı yoksa kullanılır; daha az sonuç, yorum yok | Ücretsiz |
 | Xiaohongshu (RED) | Giriş yapılmış x-mcp tarayıcı eklentisi veya `xiaohongshu-mcp` çalıştırıp her çalışmada `--search xhs` ya da `.env` içinde `INCLUDE_SOURCES=xiaohongshu` ile açın. last30days önce `http://localhost:18060`, sonra `http://host.docker.internal:18060` adresini dener; özel URL için `XIAOHONGSHU_API_BASE` kullanın | last30days API anahtarı gerekmez; yerel tarayıcı oturumu hizmetinize bağlıdır |
 | DripStack (ücretli finans bültenleri) | Her çalışmada `--search dripstack` veya `.env` içinde `INCLUDE_SOURCES=dripstack` ile açın | Anahtarsız, ücretsiz genel arama API'si |
 | Perplexity Agent API / Search API / Deep Research | Perplexity anahtarı veya Sonar yedeği olarak OpenRouter anahtarı | Kullandıkça öde; doğrudan anahtar Agent API ve arka planda Deep Research sağlar |

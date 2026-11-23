@@ -105,10 +105,10 @@ class _Hermetic:
             mock.patch("lib.health.probe_dependency", _probe_dep(probe_map, default_status)),
             mock.patch("lib.env.is_ytdlp_available", return_value=ytdlp_ok),
             # env.is_ytdlp_available() is a thin wrapper over
-            # youtube_yt.is_ytdlp_installed(). Newer keyless-fallback probes
-            # (is_shortform_oss_available) call the youtube_yt symbol directly,
-            # so pin that one too or the result depends on whether the host
-            # actually has yt-dlp on PATH.
+            # youtube_yt.is_ytdlp_installed(). The keyless shortform fallback
+            # probe (is_shortform_oss_available) calls the youtube_yt symbol
+            # directly, so pin that one too or the result depends on whether
+            # the host actually has yt-dlp on PATH.
             mock.patch("lib.youtube_yt.is_ytdlp_installed", return_value=ytdlp_ok),
             # Never read the real digg-pp-cli's help text. Tests of an older
             # Digg CLI override this.
@@ -1629,6 +1629,51 @@ class CliHealth(unittest.TestCase):
         for src in ("techmeme", "arxiv", "trustpilot"):
             self.assertIn(src, report["sources"], src)
             self.assertEqual("ok", report["sources"][src]["cli"]["status"], src)
+        self.assertEqual("ok", report["sources"]["techmeme"]["status"])
+
+    def test_outdated_techmeme_still_runs_and_shows_an_upgrade(self):
+        install = health.pp_install_cmd("techmeme")
+        detail = ("2026.9.1 (older than 2026.11.1; it still runs but reads "
+                  "only Techmeme's first 10 results; upgrade to read more pages)")
+        missing = _probe_dep()
+
+        def fake(name, timeout=health.PROBE_TIMEOUT):
+            if name == "techmeme-pp-cli":
+                return health.DependencyProbe(
+                    name=name, status=health.OK, outdated=True,
+                    detail=detail, prescription=install,
+                )
+            return missing(name, timeout)
+
+        with tempfile.TemporaryDirectory() as folder:
+            successful_run = _write_last_report(
+                folder, source_status={"techmeme": {"state": "ok", "items_returned": 10}}
+            )
+            for path, state, heading in (
+                (None, doctor.AUDIT_UNVERIFIED, "◐ TURNED ON - UNVERIFIED:"),
+                (successful_run, doctor.AUDIT_WORKING, "● WORKING:"),
+            ):
+                with self.subTest(state=state), _Hermetic(), mock.patch(
+                    "lib.health.probe_dependency", fake
+                ), mock.patch("lib.doctor._last_report_path", return_value=path):
+                    report = doctor.build_report({})
+                    block = next(
+                        block for block in doctor.render_text(report).split("\n\n")
+                        if "techmeme [CLI:" in block
+                    )
+                    self.assertEqual(heading, block.splitlines()[0])
+                    line = next(ln for ln in block.splitlines() if "techmeme [CLI:" in ln)
+                    self.assertIn("first 10 results", line)
+                    self.assertIn(f"fix: {install}", line)
+
+                    record = json.loads(doctor.render_json(report))["sources"]["techmeme"]
+                    self.assertEqual(state, record["audit_state"])
+                    self.assertEqual("ok", record["status"])
+                    self.assertEqual("ok", record["tier"])
+                    self.assertEqual("ok", record["cli"]["status"])
+                    self.assertEqual(detail, record["detail"])
+                    self.assertEqual(install, record["fix"])
+        self.assertEqual("opt-in", _build({})["sources"]["techmeme"]["status"])
 
     def test_yahoo_finance_listed_with_cli_marker(self):
         report = _build({}, probe_map={"yahoo-finance-pp-cli": health.OK})

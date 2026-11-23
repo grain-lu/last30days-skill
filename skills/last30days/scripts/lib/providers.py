@@ -13,7 +13,7 @@ from threading import Event
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from . import env, http, schema
+from . import env, http, proxy, schema
 
 GEMINI_FLASH_LITE = "gemini-3.1-flash-lite"
 GEMINI_PRO = "gemini-3.1-pro-preview"
@@ -29,7 +29,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # constant is suffix-free. If GEMINI_FLASH_LITE moves to a non-preview stable ID,
 # double-check that OpenRouter's slug still maps to the same upstream model.
 OPENROUTER_DEFAULT = "google/gemini-3.1-flash-lite-preview"
-PROVIDER_BASE_URL_KEYS = frozenset({"OPENAI_BASE_URL", "XAI_BASE_URL", "OPENROUTER_BASE_URL"})
+PROVIDER_BASE_URL_KEYS = frozenset({"OPENAI_BASE_URL", "XAI_BASE_URL", "OPENROUTER_BASE_URL", "SCRAPECREATORS_BASE_URL"})
 
 
 def _is_loopback(host: str) -> bool:
@@ -562,14 +562,19 @@ def resolve_runtime(config: dict[str, Any], depth: str) -> tuple[schema.Provider
     xai_key = config.get("XAI_API_KEY")
 
     if provider_name == "auto":
+        # An xAI lane served by the API-key proxy ranks after every provider
+        # the user holds a key for.
+        xai_proxied = xai_key == proxy.SENTINEL
         if google_key:
             provider_name = "gemini"
         elif openai_token and config.get("OPENAI_AUTH_STATUS") == env.AUTH_STATUS_OK:
             provider_name = "openai"
-        elif xai_key:
+        elif xai_key and not xai_proxied:
             provider_name = "xai"
         elif config.get("OPENROUTER_API_KEY"):
             provider_name = "openrouter"
+        elif xai_key:
+            provider_name = "xai"
         else:
             return schema.ProviderRuntime(
                 reasoning_provider="local",

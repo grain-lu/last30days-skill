@@ -75,7 +75,7 @@ KEYCHAIN_KEYS = (
     "TINYFISH_API_KEY",
     "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "PARALLEL_API_KEY", "XQUIK_API_KEY",
     "XIAOHONGSHU_API_BASE", "GITHUB_TOKEN", "BRIGHTDATA_API_KEY",
-    "X_BEARER_TOKEN",
+    "X_BEARER_TOKEN", "DEEPLINE_API_KEY",
 )
 
 # pass(1) integration: Linux/Unix analog of the Keychain source. Each key in
@@ -671,6 +671,8 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_CORPUS_IN_EXPORT', None),
         ('LAST30DAYS_LIBRARY_OWNER', None),
         ('LAST30DAYS_LIBRARY_CONTEXT', 'on'),
+        ('LAST30DAYS_AUTO_CAPTURE', 'on'),
+        ('LAST30DAYS_HOOK_DEBUG', None),
         ('LAST30DAYS_PUBLISH_PASSWORD', None),
         ('OPENAI_MODEL_PIN', None),
         ('XAI_MODEL_PIN', None),
@@ -678,6 +680,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('XAI_BASE_URL', None),
         ('OPENROUTER_BASE_URL', None),
         ('SCRAPECREATORS_API_KEY', None),
+        ('SCRAPECREATORS_BASE_URL', None),
         # TranscriptAPI (transcriptapi.com) YouTube transcript fallback key
         # from the ZeroPointRepo youtube-skills `yt` skill. Mirrors the
         # ScrapeCreators tier; read by lib/youtube_yt._ta_key().
@@ -716,6 +719,9 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_PERPLEXITY_DEEP_TIMEOUT_SECONDS', '600'),
         ('PARALLEL_API_KEY', None),
         ('XQUIK_API_KEY', None),
+        # Deepline: one key for the person-run lanes (LinkedIn profile and
+        # posts, name-to-profile lookup). Called directly, never proxied.
+        ('DEEPLINE_API_KEY', None),
         # Bright Data CLI. Optional: the CLI normally owns its own auth via
         # `brightdata login`, so this only matters for users who prefer an
         # explicit key in a `.env` file or the keychain. Registered here so
@@ -736,6 +742,13 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('LAST30DAYS_NATIVE_SEARCH', None),
         # Optional SearXNG instance for the keyless-search fallback rung.
         ('LAST30DAYS_SEARXNG_URL', None),
+        # Keyless TikTok/Instagram lane switches (lib/shortform_oss.py):
+        # discovery freshness (on/off/backend list) and TikTok creator expansion.
+        ('LAST30DAYS_SHORTFORM_FRESHNESS', None),
+        ('LAST30DAYS_SHORTFORM_CREATOR_EXPANSION', None),
+        # TikTok top comments from TikTok's public web endpoint (free, no key):
+        # on (default) or off. Off puts comment calls back on ScrapeCreators.
+        ('LAST30DAYS_TIKTOK_PUBLIC_COMMENTS', None),
         # Truthy -> disable Trustpilot's headless-Chrome WAF-cookie harvest in
         # automated contexts (cron/CI/eval). Read by trustpilot._harvest_allowed.
         ('LAST30DAYS_TRUSTPILOT_NO_BROWSER', None),
@@ -764,8 +777,6 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         ('SETUP_COMPLETE', None),
         ('INCLUDE_SOURCES', ''),
         ('EXCLUDE_SOURCES', ''),
-        ('WEIXIN_SOURCES', ''),
-        ('LAST30DAYS_CRAWL4AI', None),
         ('LAST30DAYS_DEFAULT_SEARCH', ''),
         # Resolve the user-facing default in last30days.py so an absent value
         # stays distinguishable from an explicit `default`. That distinction
@@ -828,13 +839,6 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
                 config[key] = default
         else:
             config[key] = os.environ.get(key) or merged_env.get(key, default)
-    # GEMINI_API_KEY 格式防御:shell 环境常驻的多上游中转变量(~/.llm_env)
-    # 会 export 一个 OpenAI 兼容的 sk- token 给 Claude Code 切上游用,但它
-    # 对 Google 原生 API 必然无效(合法 Google key 一律 AIza 开头),且环境
-    # 变量优先级最高、会压住 Keychain 里的真 key —— 跳过 os.environ 层,
-    # 回退到 Keychain/.env 层的值。
-    if str(config.get('GEMINI_API_KEY') or '').startswith('sk-'):
-        config['GEMINI_API_KEY'] = merged_env.get('GEMINI_API_KEY')
 
     # Export debug flag to os.environ so log.py's lazy os.environ.get()
     # picks up .env values. setdefault ensures a shell-exported value is
@@ -842,7 +846,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
     if config.get('LAST30DAYS_DEBUG'):
         os.environ.setdefault('LAST30DAYS_DEBUG', config['LAST30DAYS_DEBUG'])
 
-    # youtube_yt and grok_x read these knobs lazily from os.environ, so values
+    # youtube_yt reads these tuning knobs lazily from os.environ, so values
     # loaded from .env must be exported into the current engine process.
     for key in (
         'LAST30DAYS_YT_SUB_LANGS',
@@ -852,6 +856,7 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         'LAST30DAYS_REDDIT_KEYLESS_RATE',
         'LAST30DAYS_YT_PLAYER_CLIENT',
         'LAST30DAYS_JOBS_RESPECT_ROBOTS',
+        'SCRAPECREATORS_BASE_URL',
     ):
         value = config.get(key)
         # Empty LAST30DAYS_YT_PLAYER_CLIENT is a valid disable; other knobs
@@ -871,6 +876,11 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
         legacy = read_secret_env('SCRAPE_CREATORS_API_KEY') or merged_env.get('SCRAPE_CREATORS_API_KEY')
         if legacy:
             config['SCRAPECREATORS_API_KEY'] = legacy
+
+    if not config.get('SCRAPECREATORS_BASE_URL'):
+        legacy_base = os.environ.get('SCRAPE_CREATORS_BASE_URL') or merged_env.get('SCRAPE_CREATORS_BASE_URL')
+        if legacy_base:
+            config['SCRAPECREATORS_BASE_URL'] = legacy_base
 
     # Multi-key rotation: comma-separated SCRAPECREATORS_API_KEY round-robins
     # via random.choice per run. Originally added in #268, accidentally dropped
@@ -954,6 +964,12 @@ def get_config(policy: ConfigLoadPolicy | None = None) -> dict[str, Any]:
             config['_BROWSER_COOKIE_MODE'] = "off"
         else:
             _discover_and_apply_x_credentials(config)
+
+    # Proxy mode (LAST30DAYS_API_MODE=proxy): each paid lane the user has no
+    # key for is served through the metered proxy. Filled last, so a user's
+    # own key from any source always wins for its provider.
+    from . import proxy as _proxy
+    _proxy.fill_config(config)
 
     # Fixture recording (--record-fixtures) must redact a credential that
     # came from a file, Keychain, or pass, not only one exported in the
@@ -1165,9 +1181,26 @@ REDDIT_SETUP_BROWSERS = (
 )
 
 
+# Placeholder for a provider key served by the API-key proxy (lib/proxy.py
+# owns the routing; it is defined here because proxy imports this module).
+PROXY_SENTINEL = "last30days-proxy-lane"
+
+
+def proxy_mode_requested() -> bool:
+    """True when LAST30DAYS_API_MODE selects the metered proxy (lib/proxy.py)."""
+    return (os.environ.get("LAST30DAYS_API_MODE") or "").strip().lower() == "proxy"
+
+
 def hosted_backend_configured() -> bool:
-    """True when research would run through the remote API backend."""
-    return bool(read_secret_env("LAST30DAYS_API_KEY") and os.environ.get("LAST30DAYS_API_BASE"))
+    """True when research would run through the remote API backend.
+
+    Proxy mode keeps research on the local engine, so it is never hosted.
+    """
+    return bool(
+        read_secret_env("LAST30DAYS_API_KEY")
+        and os.environ.get("LAST30DAYS_API_BASE")
+        and not proxy_mode_requested()
+    )
 
 
 def global_cookie_refusal(config: dict[str, Any], reddit_consent: bool = False) -> str:
@@ -1913,6 +1946,10 @@ def x_backend_chain(config: dict[str, Any], local_only: bool = False) -> list[st
             b for b in x_policy(config).auto_chain
             if _x_backend_available(b, config, has_bird_creds, local_only)
         ]
+        # An xAI lane served by the API-key proxy (lib/proxy.py) is paid per
+        # call, so every backend the user set up themselves goes first.
+        if 'xai' in chain and config.get('XAI_API_KEY') == PROXY_SENTINEL:
+            chain = [b for b in chain if b != 'xai'] + ['xai']
 
     if 'bird' in chain:
         _inject_bird_credentials(config)
@@ -2015,6 +2052,12 @@ def is_youtube_comments_available(
     if not is_youtube_sc_available(config):
         return False
     return 'youtube_comments' in _parse_include_sources(config)
+
+
+def is_tiktok_public_comments_on(config: dict[str, Any]) -> bool:
+    """TikTok comments come from the free public endpoint unless switched off."""
+    raw = config.get('LAST30DAYS_TIKTOK_PUBLIC_COMMENTS') or os.environ.get('LAST30DAYS_TIKTOK_PUBLIC_COMMENTS') or 'on'
+    return str(raw).strip().lower() not in ('off', '0', 'false', 'no')
 
 
 def is_tiktok_comments_available(config: dict[str, Any]) -> bool:
@@ -2135,20 +2178,49 @@ def is_polymarket_available() -> bool:
     return True
 
 
-def is_shortform_oss_available(config: dict[str, Any] | None = None) -> bool:
-    """yt-dlp extract + a discovery backend (SearXNG / TinyFish / Serper / Exa / Brave / keyless)."""
+def shortform_discovery_sources(
+    config: dict[str, Any] | None = None, kind: str = "tiktok",
+) -> list[str]:
+    """Discovery sources armed for the keyless TikTok / Instagram lane, in
+    the order the lane tries them.
+
+    Exa only counts for TikTok: its API returns 0 Instagram posts. A host
+    with native web search (LAST30DAYS_NATIVE_SEARCH) counts as "host search":
+    it hands the engine post URLs through --shortform-urls, and it is also
+    why the keyless floor is off there.
+    """
+    cfg = config or {}
+    armed: list[str] = []
+    if (cfg.get('LAST30DAYS_SEARXNG_URL') or '').strip():
+        armed.append("SearXNG")
+    if cfg.get('SERPER_API_KEY'):
+        armed.append("Serper")
+    if kind == 'tiktok' and cfg.get('EXA_API_KEY'):
+        armed.append("Exa")
+    if cfg.get('BRAVE_API_KEY'):
+        armed.append("Brave")
+    if keyless_web_allowed(cfg):
+        armed.append("keyless floor")
+    else:
+        armed.append("host search")
+    return armed
+
+
+def is_shortform_oss_available(
+    config: dict[str, Any] | None = None, kind: str = "tiktok",
+) -> bool:
+    """yt-dlp extract + a discovery source (see ``shortform_discovery_sources``).
+
+    kind is the short-form source ("tiktok" or "instagram"). yt-dlp presence
+    follows the YouTube source's routing: local binary, or
+    LAST30DAYS_YOUTUBE_SSH_HOST with yt-dlp on the remote end. Every host has
+    a discovery source: the keyless floor, or on a native-search host the
+    host's own search through --shortform-urls.
+    """
     from . import youtube_yt
     if not youtube_yt.is_ytdlp_installed():
         return False
-    cfg = config or {}
-    return bool(
-        (cfg.get('LAST30DAYS_SEARXNG_URL') or '').strip()
-        or cfg.get('TINYFISH_API_KEY')
-        or cfg.get('SERPER_API_KEY')
-        or cfg.get('EXA_API_KEY')
-        or cfg.get('BRAVE_API_KEY')
-        or keyless_web_allowed(cfg)
-    )
+    return bool(shortform_discovery_sources(config, kind))
 
 
 def is_tiktok_available(config: dict[str, Any]) -> bool:
@@ -2219,12 +2291,49 @@ def is_instagram_available(config: dict[str, Any]) -> bool:
     Returns True if SCRAPECREATORS_API_KEY is set, or if yt-dlp plus a
     web-discovery backend can serve the keyless fallback.
     """
-    return bool(config.get('SCRAPECREATORS_API_KEY') or is_shortform_oss_available(config))
+    return bool(
+        config.get('SCRAPECREATORS_API_KEY')
+        or is_shortform_oss_available(config, "instagram")
+    )
 
 
 def get_instagram_token(config: dict[str, Any]) -> str:
     """Get Instagram API token (same ScrapeCreators key as TikTok)."""
     return config.get('SCRAPECREATORS_API_KEY') or ''
+
+
+DEFAULT_SCRAPECREATORS_BASE_URL = "https://api.scrapecreators.com"
+SCRAPECREATORS_BASE_URL = DEFAULT_SCRAPECREATORS_BASE_URL
+
+
+def get_scrapecreators_base_url(config: dict[str, Any] | None = None) -> str:
+    """Get ScrapeCreators API base URL.
+
+    Defaults to https://api.scrapecreators.com. Can be overridden via
+    SCRAPECREATORS_BASE_URL (or SCRAPE_CREATORS_BASE_URL) in environment
+    or config to point at a local mock server, caching proxy, or
+    compatible alternative provider.
+
+    Remote overrides must be https:// (http:// is allowed only on loopback)
+    to protect API keys from cleartext transmission. Trailing slashes are stripped.
+    """
+    raw = None
+    if config:
+        raw = config.get("SCRAPECREATORS_BASE_URL") or config.get("SCRAPE_CREATORS_BASE_URL")
+    if not raw:
+        raw = os.environ.get("SCRAPECREATORS_BASE_URL") or os.environ.get("SCRAPE_CREATORS_BASE_URL")
+    if raw and str(raw).strip():
+        val = str(raw).strip().rstrip("/")
+        from . import providers
+        if providers.allowed_base_url_override(val):
+            return val
+        sys.stderr.write(
+            f"[last30days] WARNING: ignoring SCRAPECREATORS_BASE_URL - a provider endpoint override "
+            "must be https:// (http:// is allowed only on localhost), otherwise the API "
+            f"key would be sent in cleartext. Using {DEFAULT_SCRAPECREATORS_BASE_URL} instead.\n"
+        )
+        sys.stderr.flush()
+    return DEFAULT_SCRAPECREATORS_BASE_URL
 
 
 def get_xiaohongshu_api_base(config: dict[str, Any]) -> str:

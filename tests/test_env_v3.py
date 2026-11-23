@@ -171,5 +171,35 @@ class ThreadsAvailabilityTests(unittest.TestCase):
             "INCLUDE_SOURCES": "",
         }))
 
+
+class TikTokApifyTokenTests(unittest.TestCase):
+    """APIFY_API_TOKEN is a legacy alias only; it was never wired to an actor.
+
+    Found by grain-lu in #1533: the old fallback sent the Apify token to
+    ScrapeCreators and marked TikTok ready with no usable key.
+    """
+
+    def test_tiktok_token_never_falls_back_to_apify(self):
+        self.assertEqual(env.get_tiktok_token({"APIFY_API_TOKEN": "legacy"}), "")
+        self.assertEqual(
+            env.get_tiktok_token({"APIFY_API_TOKEN": "legacy",
+                                  "SCRAPECREATORS_API_KEY": "sc"}),
+            "sc",
+        )
+
+    def test_tiktok_unavailable_on_apify_only_config(self):
+        # The Apify token never arms TikTok; only the keyless lane (yt-dlp plus
+        # a discovery backend) can, so take yt-dlp away to see the token alone.
+        from lib import youtube_yt
+        with mock.patch.object(youtube_yt, "is_ytdlp_installed", return_value=False):
+            self.assertFalse(env.is_tiktok_available({"APIFY_API_TOKEN": "legacy"}))
+            self.assertFalse(env.is_apify_available({"APIFY_API_TOKEN": "legacy"}))
+        self.assertTrue(env.is_tiktok_available({"SCRAPECREATORS_API_KEY": "sc"}))
+
+    def test_instagram_token_never_falls_back_to_apify(self):
+        self.assertEqual(env.get_instagram_token({"APIFY_API_TOKEN": "legacy"}), "")
+        self.assertEqual(env.get_instagram_token({"SCRAPECREATORS_API_KEY": "sc"}), "sc")
+
+
 if __name__ == "__main__":
     unittest.main()

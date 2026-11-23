@@ -224,6 +224,10 @@ npx skills update -g
 
 Dá para listar e remover com `npx skills list -g` e `npx skills remove last30days -g`.
 
+### DeepSeek Harness
+
+O [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) carrega skills de `~/.agents/skills` (ou `$DSH_AGENTS_HOME/skills`, quando definido). É ali que a instalação global com `npx skills add mvanhorn/last30days-skill -g` coloca o last30days, então o DSH encontra a skill sem configuração extra. Reinicie o DSH depois de instalar.
+
 ### claude.ai (web)
 
 1. [Baixe `last30days.skill`](https://github.com/mvanhorn/last30days-skill/releases/latest/download/last30days.skill) da versão mais recente
@@ -286,6 +290,7 @@ Essas plataformas não têm relação nenhuma entre si. O X não sabe o que o Re
 | YouTube | `brew install yt-dlp` | De graça |
 | Bluesky | Uma senha de aplicativo do bsky.app | De graça |
 | TikTok + Instagram + Threads + Pinterest + LinkedIn + comentários do YouTube | Uma chave do ScrapeCreators | 10.000 chamadas gratuitas e depois pagamento por uso |
+| TikTok (e Instagram, com cobertura limitada) sem chave | `yt-dlp`, usado quando não há chave do ScrapeCreators; menos resultados e sem comentários | De graça |
 | Xiaohongshu (RED) | Deixe rodando um plugin de navegador x-mcp logado ou um serviço `xiaohongshu-mcp` e habilite a fonte com `--search xhs` por execução ou com `INCLUDE_SOURCES=xiaohongshu` no `.env`; o last30days testa automaticamente `http://localhost:18060` e depois `http://host.docker.internal:18060`, ou use `XIAOHONGSHU_API_BASE` para uma URL própria | Não precisa de chave de API do last30days; depende do seu serviço local de sessão de navegador |
 | DripStack (newsletters financeiras premium) | Opcional: `--search dripstack` por execução, ou `INCLUDE_SOURCES=dripstack` no `.env` | Sem chave; API de busca pública e gratuita |
 | Perplexity Agent API / Search API / Deep Research | Uma chave do Perplexity, ou uma chave do OpenRouter como alternativa para o Sonar | Pagamento por uso; uma chave direta ativa a Agent API e o Deep Research em segundo plano |
