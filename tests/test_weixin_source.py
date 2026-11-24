@@ -98,3 +98,23 @@ def test_activate_weixin_flag_adds_include():
     assert config["WEIXIN_SOURCES"] == "机器之心"
     assert "weixin" in config["INCLUDE_SOURCES"]
     assert "weixin" in requested
+
+
+def test_doctor_lists_weixin_as_opt_in():
+    """Doctor must keep listing weixin — a squash-merge once ate this wiring.
+
+    The source is opt-in, so the default-config verdict is "opt-in", never
+    absent from the report.
+    """
+    from tests.test_doctor import _build
+
+    report = _build({})
+    record = report["sources"].get("weixin")
+    assert record is not None, "weixin missing from doctor's source report"
+    assert record["status"] == "opt-in"
+    assert "INCLUDE_SOURCES=weixin" in record["requires"]
+
+    report = _build({"INCLUDE_SOURCES": "weixin", "WEIXIN_SOURCES": "机器之心"})
+    record = report["sources"]["weixin"]
+    assert record["status"] == "ok"
+    assert "1 account(s) configured" in (record.get("detail") or "")

@@ -85,3 +85,16 @@ def test_search_empty_http_returns_error(monkeypatch):
     result = bilibili.search_bilibili("topic", "2025-08-01", "2025-08-31", depth="quick")
     assert result["items"] == []
     assert "error" in result
+
+
+def test_doctor_lists_bilibili_as_opt_in():
+    """Doctor must keep listing bilibili — a squash-merge once ate this wiring."""
+    from tests.test_doctor import _build
+
+    report = _build({})
+    record = report["sources"].get("bilibili")
+    assert record is not None, "bilibili missing from doctor's source report"
+    assert record["status"] == "opt-in"
+
+    report = _build({"INCLUDE_SOURCES": "bilibili"})
+    assert report["sources"]["bilibili"]["status"] == "ok"
